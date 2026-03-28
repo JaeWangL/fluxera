@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=80.9.0,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluxera"
+version = "0.0.1"
+description = "Async-native message processing inspired by Dramatiq."
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["asyncio", "dramatiq", "message-queue", "redis", "worker"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "redis>=5,<8",
+]
+
+[project.scripts]
+fluxera = "fluxera.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["fluxera*"]
+
+[tool.setuptools.package-data]
+fluxera = ["brokers/redis_lua/*.lua"]
