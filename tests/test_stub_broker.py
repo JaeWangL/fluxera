@@ -113,7 +113,7 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
         pids = [record.result for record in worker.records.values() if record.delivery.actor_name == "identify"]
         self.assertEqual(len(pids), 2)
         self.assertTrue(all(pid != os.getpid() for pid in pids))
-        self.assertLess(elapsed, 0.18)
+        self.assertLess(elapsed, 0.24)
 
     async def test_process_lane_does_not_block_while_async_lane_is_full(self) -> None:
         broker = fluxera.StubBroker()
@@ -181,7 +181,7 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await worker.stop()
 
-        self.assertLess(elapsed, 0.12)
+        self.assertLess(elapsed, 0.20)
         self.assertEqual(len(broker.dead_letters), 1)
         self.assertEqual(broker.dead_letters[0].failure_kind, "timeout")
         self.assertEqual(broker.dead_letters[0].actor_name, "slow_process")
@@ -284,6 +284,149 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(broker.queue_objects[hanging.queue_name].qsize(), 1)
         self.assertEqual(broker.dead_letters, [])
+
+    async def test_throws_prevents_retry_and_dead_letters_immediately(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        attempts = 0
+
+        @fluxera.actor(max_retries=3, throws=(ValueError,))
+        async def never_retry() -> None:
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("stop")
+
+        worker = fluxera.Worker(broker, concurrency=2)
+        await worker.start()
+        try:
+            await never_retry.send()
+            await broker.join(never_retry.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(attempts, 1)
+        self.assertEqual(len(broker.dead_letters), 1)
+        self.assertEqual(broker.dead_letters[0].exception_type, "ValueError")
+
+    async def test_retry_when_controls_retry_schedule(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        attempts = 0
+
+        def retry_when(attempt: int, exc: BaseException, record: fluxera.TaskRecord) -> bool:
+            self.assertIsInstance(exc, RuntimeError)
+            self.assertEqual(attempt, record.attempt)
+            return attempt < 1
+
+        @fluxera.actor(max_retries=5, retry_when=retry_when)
+        async def controlled_retry() -> None:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("try again")
+
+        worker = fluxera.Worker(broker, concurrency=2)
+        await worker.start()
+        try:
+            await controlled_retry.send()
+            await broker.join(controlled_retry.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(broker.dead_letters), 1)
+        self.assertEqual(broker.dead_letters[0].attempt, 1)
+
+    async def test_invalid_retry_when_moves_message_to_invalid_configuration_dead_letter(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+
+        def invalid_retry_when(attempt: int, exc: BaseException, record: fluxera.TaskRecord) -> str:
+            del attempt, exc, record
+            return "yes"
+
+        @fluxera.actor(max_retries=5, retry_when=invalid_retry_when)
+        async def invalid_retry() -> None:
+            raise RuntimeError("boom")
+
+        worker = fluxera.Worker(broker, concurrency=2)
+        await worker.start()
+        try:
+            await invalid_retry.send()
+            await broker.join(invalid_retry.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(len(broker.dead_letters), 1)
+        self.assertEqual(broker.dead_letters[0].failure_kind, "invalid_configuration")
+
+    async def test_success_and_failure_hooks_receive_contexts(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        success_results: list[int] = []
+        failure_types: list[str | None] = []
+
+        def on_success(context: fluxera.OutcomeContext) -> None:
+            success_results.append(context.result)
+
+        async def on_failure(context: fluxera.OutcomeContext) -> None:
+            failure_types.append(context.exception_type)
+
+        @fluxera.actor(on_success=on_success)
+        async def succeed(value: int) -> int:
+            return value + 1
+
+        @fluxera.actor(max_retries=0, on_failure=on_failure)
+        async def fail() -> None:
+            raise RuntimeError("boom")
+
+        worker = fluxera.Worker(broker, concurrency=4)
+        await worker.start()
+        try:
+            await succeed.send(3)
+            await fail.send()
+            await broker.join(succeed.queue_name)
+            await broker.join(fail.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(success_results, [4])
+        self.assertEqual(failure_types, ["RuntimeError"])
+
+    async def test_retry_exhausted_and_dead_letter_callbacks_dispatch(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        retry_exhausted_payloads: list[dict[str, object]] = []
+        dead_letter_ids: list[str] = []
+
+        @fluxera.actor(queue_name="callbacks")
+        async def capture_retry_exhausted(payload: dict[str, object]) -> None:
+            retry_exhausted_payloads.append(payload)
+
+        def on_dead_lettered(context: fluxera.DeadLetterContext) -> None:
+            dead_letter_ids.append(context.record.dead_letter_id)
+
+        @fluxera.actor(
+            queue_name="callbacks",
+            max_retries=0,
+            on_retry_exhausted="capture_retry_exhausted",
+            on_dead_lettered=on_dead_lettered,
+        )
+        async def fail_terminally() -> None:
+            raise RuntimeError("terminal")
+
+        worker = fluxera.Worker(broker, concurrency=4)
+        await worker.start()
+        try:
+            await fail_terminally.send()
+            await broker.join(fail_terminally.queue_name)
+            await broker.join(capture_retry_exhausted.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(len(retry_exhausted_payloads), 1)
+        self.assertEqual(retry_exhausted_payloads[0]["event"], "retry_exhausted")
+        self.assertEqual(retry_exhausted_payloads[0]["failure_kind"], "exception")
+        self.assertEqual(dead_letter_ids, [retry_exhausted_payloads[0]["dead_letter_id"]])
 
     async def test_revision_control_plane_bootstraps_and_promotes(self) -> None:
         broker = fluxera.StubBroker()

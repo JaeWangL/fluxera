@@ -346,7 +346,34 @@ Retention cleanup should:
 3. remove secondary indexes
 4. increment purge metrics
 
-## 9. Retry Policy Design
+## 9. RETRY_AND_CALLBACKS
+
+### 9.1 Design stance
+
+`Fluxera` should not invent a completely new retry vocabulary unless it has a
+clear operational advantage.
+
+On this topic, `Dramatiq` already has the better baseline:
+
+- sensible retry option names
+- a proven `throws` escape hatch
+- `retry_when`
+- `on_retry_exhausted`
+- jittered exponential backoff
+
+So the recommendation is:
+
+- **adopt Dramatiq-compatible retry semantics by default**
+- **extend callbacks in a Fluxera-native way where async execution gives a clear advantage**
+
+This split is intentional.
+
+Retry policy mostly needs predictability and compatibility.
+
+Callback handling benefits from Fluxera's async-native runtime and richer
+failure metadata.
+
+### 9.2 Retry policy design
 
 Retry needs to be more expressive than the current minimal model.
 
@@ -358,13 +385,16 @@ Recommended actor and message options:
 - `retry_on_timeout`
 - `retry_for`
 - `retry_when`
+- `throws`
 - `jitter`
-- `on_retry_scheduled`
 - `on_retry_exhausted`
-- `on_dead_lettered`
-- `on_failure`
 
-### 9.1 Default semantics
+Recommended compatibility rule:
+
+- if an application already uses Dramatiq-style retry options, Fluxera should
+  interpret them the same way whenever possible
+
+#### 9.2.1 Default semantics
 
 Conservative runtime default:
 
@@ -378,7 +408,7 @@ Recommended production policy when retries are enabled:
 
 `Fluxera` should not silently retry with zero delay unless that is explicitly requested.
 
-### 9.2 Backoff algorithm
+#### 9.2.2 Backoff algorithm
 
 Recommended policy:
 
@@ -386,9 +416,13 @@ Recommended policy:
 - full jitter by default
 - capped by `max_backoff`
 
-This avoids retry stampedes better than deterministic doubling.
+Reason:
 
-### 9.3 Predicate-based retry
+- Dramatiq's jittered strategy is already better than Fluxera's current deterministic doubling
+- deterministic retry timing creates synchronized retry bursts under async-heavy failure conditions
+- Fluxera has no stronger competing strategy today, so adopting jitter is a direct improvement
+
+#### 9.2.3 Predicate-based retry
 
 `retry_when` should be supported as:
 
@@ -403,7 +437,20 @@ Rules:
 - timeout failures still pass through the predicate
 - invalid predicates should cause a terminal `invalid_configuration` DLQ record
 
-### 9.4 Exhaustion semantics
+#### 9.2.4 `throws`
+
+`throws` should remain a first-class escape hatch.
+
+Meaning:
+
+- if an exception matches `throws`, Fluxera must not schedule another retry
+- the message should move directly to terminal failure handling
+
+This is a compatibility feature first, not an innovation point.
+
+Keeping it avoids migration friction for existing Dramatiq users.
+
+#### 9.2.5 Exhaustion semantics
 
 When the runtime decides that no more retries will be attempted:
 
@@ -411,11 +458,13 @@ When the runtime decides that no more retries will be attempted:
 2. it must persist the dead-letter record
 3. it may optionally enqueue an exhaustion callback actor
 
-## 10. Callback and Hook Architecture
+### 9.3 Callback and hook architecture
 
 Fluxera should support two separate layers.
 
-### 10.1 Runtime hooks
+This is where Fluxera can improve beyond Dramatiq.
+
+#### 9.3.1 Runtime hooks
 
 These are in-process hooks for logging, metrics, tracing, and error reporting.
 
@@ -434,8 +483,15 @@ Rules:
 - hook failures are logged and swallowed
 - hooks run after the durable state transition
 - hooks must not mutate the record
+- hooks may be sync or async callables, but the runtime should normalize both
 
-### 10.2 Callback actors
+Why this is better than copying Dramatiq middleware directly:
+
+- Fluxera is task and event-loop centric, not worker-thread middleware centric
+- hooks can receive richer runtime objects like `TaskRecord` and `DeadLetterRecord`
+- async hooks fit naturally into the Fluxera runtime
+
+#### 9.3.2 Callback actors
 
 These are queue-based follow-up actions for business workflows.
 
@@ -445,6 +501,9 @@ Suggested actor options:
 - `on_dead_lettered`
 - `on_failure`
 - `on_success`
+
+These should continue to support actor-name based dispatch because that keeps
+producer semantics simple and matches existing Dramatiq mental models.
 
 Callback payloads must be JSON-serializable summaries, not raw exception objects.
 
@@ -466,7 +525,48 @@ Suggested dead-letter callback payload:
 }
 ```
 
-## 11. Python Admin Surface
+#### 9.3.3 Why two layers
+
+This separation is important.
+
+Runtime hooks are for:
+
+- logs
+- metrics
+- tracing
+- Sentry or telemetry export
+
+Callback actors are for:
+
+- queue-based side effects
+- notifications
+- workflow follow-ups
+
+Mixing them is risky because callback failures could accidentally interfere with
+core retry or DLQ state transitions.
+
+### 9.4 Comparative rationale vs Dramatiq
+
+The recommended strategy is:
+
+- **Retry**: mostly take Dramatiq's semantics as-is
+- **Callbacks**: go beyond Dramatiq using async-native hooks plus callback actors
+
+Why this split is justified:
+
+- Dramatiq is already better at retry policy design than current Fluxera
+- Fluxera already has richer failure records than Dramatiq through `TaskRecord`
+  and `DeadLetterRecord`
+- richer records make callback payloads and observability hooks more useful
+- async hooks are a natural fit for Fluxera but not for Dramatiq's original
+  worker-thread middleware model
+
+This means Fluxera can credibly improve on Dramatiq here, but only on the
+callback and observability side.
+
+On retry policy itself, compatibility and maturity matter more than novelty.
+
+## 10. Python Admin Surface
 
 Fluxera should expose an admin surface that is easy to call from applications and tooling.
 
@@ -517,7 +617,7 @@ Reason:
 
 Exact replay with preserved `message_id` may exist as an explicit override, but it should not be the default.
 
-## 12. CLI Surface
+## 11. CLI Surface
 
 The CLI should mirror the Python admin functions.
 
@@ -562,7 +662,7 @@ Required filtering and display fields:
 - worker revision
 - resolution state
 
-## 13. Logging and Metrics
+## 12. Logging and Metrics
 
 Every retry and dead-letter transition should emit structured logs.
 
@@ -603,33 +703,27 @@ Recommended metrics:
 - `fluxera_dead_letter_active`
 - `fluxera_dead_letter_oldest_age_seconds`
 
-## 14. Required Changes Relative to Current Fluxera
+## 13. Required Changes Relative to Current Fluxera
 
 The current implementation is a useful base, but it does not yet satisfy this design.
 
-Primary gaps:
+Primary gaps that remain after the current implementation pass:
 
-- DLQ stores only `message_id`, not a structured dead-letter record
-- failure cause is not durable
-- retry backoff has no jitter
-- there is no `retry_when`
-- there are no retry or DLQ callbacks
-- there is no `dlq` CLI or Python admin page type
-- payload-missing transport entries are currently dropped instead of dead-lettered
+- there is no dedicated web admin page yet
+- retry callback payloads and lifecycle hooks are implemented, but metrics and long-term compatibility guarantees still need hardening
+- DLQ retention cleanup and aggregation stats are still intentionally simple
+- transport and runtime failure policies need more production soak time under high retry volume
 
-## 15. Implementation Order
+## 14. Implementation Order
 
 Recommended order:
 
-1. add `DeadLetterRecord` model and persistence path
-2. route `integrity_missing_payload` and decode failures into DLQ
-3. add Python admin surface
-4. add `fluxera dlq ...` CLI
-5. add retry jitter and `retry_when`
-6. add runtime hooks and callback actors
-7. add retention cleanup and DLQ stats
+1. harden retry callback payload contracts across versions
+2. add DLQ retention cleanup and aggregation stats
+3. expose DLQ and retry metrics through a first-class metrics surface
+4. add optional admin UI or dashboard integration
 
-## 16. Non-Goals
+## 15. Non-Goals
 
 This document does not try to provide:
 

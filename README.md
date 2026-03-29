@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.0.8` is the current public alpha.
+`0.0.9` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -156,6 +156,80 @@ choose to auto-promote in their entrypoint or release automation.
 - Deduplication is an enqueue-time admission policy, not exactly-once execution.
 - Effectively-once side effects require idempotency keys or application-level dedupe.
 - Redis workers renew leases for long-running tasks and reclaim stale pending deliveries.
+
+## Retry And Callbacks
+
+Fluxera now supports Dramatiq-compatible retry controls plus async-native
+callbacks.
+
+Retry example:
+
+```python
+import fluxera
+
+
+broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15", namespace="retry-example")
+
+
+def retry_when(attempt: int, exc: BaseException, record: fluxera.TaskRecord) -> bool:
+    del record
+    return attempt < 3 and not isinstance(exc, ValueError)
+
+
+@fluxera.actor(
+    broker=broker,
+    queue_name="default",
+    max_retries=5,
+    min_backoff=15_000,
+    max_backoff=300_000,
+    jitter="full",
+    retry_when=retry_when,
+    throws=(ValueError,),
+)
+async def fetch_report(report_id: str) -> None:
+    raise RuntimeError(f"temporary upstream failure for {report_id}")
+```
+
+Callback example:
+
+```python
+import fluxera
+
+
+broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15", namespace="callback-example")
+
+
+def on_success(context: fluxera.OutcomeContext) -> None:
+    print("finished", context.actor_name, context.message.message_id, context.result)
+
+
+async def on_failure(context: fluxera.OutcomeContext) -> None:
+    print("failed", context.failure_kind, context.exception_type)
+
+
+@fluxera.actor(broker=broker, queue_name="callbacks")
+async def notify_exhausted(payload: dict[str, object]) -> None:
+    print("retry exhausted", payload["dead_letter_id"])
+
+
+@fluxera.actor(
+    broker=broker,
+    queue_name="default",
+    on_success=on_success,
+    on_failure=on_failure,
+    on_retry_exhausted="notify_exhausted",
+)
+async def generate_summary() -> dict[str, str]:
+    return {"status": "ok"}
+```
+
+Rules of thumb:
+
+- `throws` skips retries and goes straight to terminal handling
+- `retry_when` overrides the simpler retry count rule
+- `on_success` and `on_failure` can be sync or async callables
+- `on_retry_exhausted` and `on_dead_lettered` can be callables or actor names
+- actor callbacks receive JSON-safe payloads, not raw exception objects
 
 ## Distributed Concurrency Limits
 

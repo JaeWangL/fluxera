@@ -16,6 +16,7 @@ from .admin import (
 )
 from .actor import Actor, actor
 from .broker import Broker, Consumer, Delivery, get_broker, set_broker
+from .callbacks import DeadLetterContext, OutcomeContext
 from .dead_letters import DeadLetterRecord
 from .encoder import JSONMessageEncoder, PickleMessageEncoder
 from .errors import RateLimitExceeded
@@ -30,6 +31,7 @@ __all__ = [
     "Broker",
     "Consumer",
     "ConcurrentRateLimiter",
+    "DeadLetterContext",
     "DeadLetterRecord",
     "DeadLetterList",
     "DeadLetterResolution",
@@ -37,6 +39,7 @@ __all__ = [
     "Delivery",
     "JSONMessageEncoder",
     "Message",
+    "OutcomeContext",
     "PickleMessageEncoder",
     "RateLimitExceeded",
     "RedisBroker",

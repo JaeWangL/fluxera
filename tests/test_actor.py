@@ -39,11 +39,17 @@ class ActorTests(unittest.IsolatedAsyncioTestCase):
         broker = fluxera.StubBroker()
         fluxera.set_broker(broker)
 
+        def retry_when(attempt: int, exc: BaseException, record: fluxera.TaskRecord) -> bool:
+            del attempt, exc, record
+            return False
+
         @fluxera.actor(
             queue_name="jobs",
             max_retries=2,
             throws=(ValueError,),
             retry_for=(RuntimeError,),
+            retry_when=retry_when,
+            on_success="success_actor",
         )
         async def noop() -> None:
             return None
@@ -52,6 +58,8 @@ class ActorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.queue_name, "jobs")
         self.assertEqual(message.options["max_retries"], 2)
         self.assertEqual(message.options["timeout"], 25)
+        self.assertEqual(message.options["on_success"], "success_actor")
         self.assertNotIn("throws", message.options)
         self.assertNotIn("retry_for", message.options)
+        self.assertNotIn("retry_when", message.options)
         self.assertIsInstance(JSONMessageEncoder().dumps(message), bytes)

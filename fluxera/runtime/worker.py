@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import multiprocessing as mp
 import os
 import pickle
+import random
 import time
 import traceback
 from collections import defaultdict
@@ -13,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
 from ..broker import Broker, Consumer, Delivery
+from ..callbacks import DeadLetterContext, OutcomeContext
 from ..dead_letters import DeadLetterRecord, FailureKind
 from ..errors import ActorNotFound, RemoteExecutionError, WorkerError
 from ..message import current_millis
@@ -22,6 +26,9 @@ if TYPE_CHECKING:
 
 
 DEFAULT_PROCESS_START_METHOD = "spawn"
+DEFAULT_RETRY_JITTER = "full"
+
+logger = logging.getLogger(__name__)
 
 
 def _execute_call(fn, args, kwargs):
@@ -93,7 +100,10 @@ class RetryPolicy:
     min_backoff_ms: int = 0
     max_backoff_ms: int = 60_000
     retry_for: Optional[tuple[type[BaseException], ...]] = None
+    retry_when: Any = None
+    throws: Optional[tuple[type[BaseException], ...]] = None
     retry_on_timeout: bool = True
+    jitter: str = DEFAULT_RETRY_JITTER
 
 
 class _ProcessSlot:
@@ -652,6 +662,13 @@ class Worker:
             record.state = "succeeded"
             record.final_action = "ack"
             await item.consumer.ack(item.delivery)
+            await self._emit_outcome_callbacks(
+                item,
+                record,
+                event="success",
+                option_name="on_success",
+                result=record.result,
+            )
         except TimeoutError as exc:
             record.state = "timed_out"
             record.exception = exc
@@ -800,7 +817,10 @@ class Worker:
         raw_min_backoff = delivery.options.get("min_backoff", actor.options.get("min_backoff", 0))
         raw_max_backoff = delivery.options.get("max_backoff", actor.options.get("max_backoff", 60_000))
         retry_for = delivery.options.get("retry_for", actor.options.get("retry_for"))
+        retry_when = delivery.options.get("retry_when", actor.options.get("retry_when"))
+        throws = delivery.options.get("throws", actor.options.get("throws"))
         retry_on_timeout = delivery.options.get("retry_on_timeout", actor.options.get("retry_on_timeout", True))
+        raw_jitter = delivery.options.get("jitter", actor.options.get("jitter", DEFAULT_RETRY_JITTER))
 
         try:
             max_retries = int(raw_max_retries)
@@ -816,23 +836,166 @@ class Worker:
         if max_backoff_ms < min_backoff_ms:
             raise ValueError("max_backoff must be greater than or equal to min_backoff.")
 
-        if retry_for is not None:
-            if isinstance(retry_for, type):
-                retry_for = (retry_for,)
-            elif not isinstance(retry_for, tuple):
-                raise ValueError("retry_for must be an exception type or a tuple of exception types.")
+        retry_for = self._coerce_exception_types(retry_for, option_name="retry_for")
+        throws = self._coerce_exception_types(throws, option_name="throws")
 
-            for exc_type in retry_for:
-                if not isinstance(exc_type, type) or not issubclass(exc_type, BaseException):
-                    raise ValueError("retry_for entries must be exception types.")
+        if retry_when is not None and not callable(retry_when):
+            raise ValueError("retry_when must be callable.")
+
+        jitter = self._coerce_retry_jitter(raw_jitter)
 
         return RetryPolicy(
             max_retries=max_retries,
             min_backoff_ms=min_backoff_ms,
             max_backoff_ms=max_backoff_ms,
             retry_for=retry_for,
+            retry_when=retry_when,
+            throws=throws,
             retry_on_timeout=bool(retry_on_timeout),
+            jitter=jitter,
         )
+
+    def _coerce_exception_types(self, raw_value: Any, *, option_name: str) -> Optional[tuple[type[BaseException], ...]]:
+        if raw_value is None:
+            return None
+
+        if isinstance(raw_value, type):
+            raw_value = (raw_value,)
+        elif not isinstance(raw_value, tuple):
+            raise ValueError(f"{option_name} must be an exception type or a tuple of exception types.")
+
+        for exc_type in raw_value:
+            if not isinstance(exc_type, type) or not issubclass(exc_type, BaseException):
+                raise ValueError(f"{option_name} entries must be exception types.")
+
+        return raw_value
+
+    def _coerce_retry_jitter(self, raw_value: Any) -> str:
+        if raw_value in {None, True}:
+            return "full"
+        if raw_value is False:
+            return "none"
+        if isinstance(raw_value, str):
+            normalized = raw_value.strip().lower()
+            if normalized in {"none", "full"}:
+                return normalized
+        raise ValueError("jitter must be one of: True, False, 'full', 'none'.")
+
+    def _callback_targets(self, actor, delivery: Delivery, option_name: str) -> list[Any]:
+        target = delivery.options.get(option_name, actor.options.get(option_name))
+        if target is None:
+            return []
+        if isinstance(target, (list, tuple, set)):
+            return [item for item in target if item is not None]
+        return [target]
+
+    def _build_outcome_context(
+        self,
+        item: _ScheduledDelivery,
+        record: TaskRecord,
+        *,
+        event: str,
+        result: Any = None,
+        failure_kind: Optional[FailureKind] = None,
+        exc: Optional[BaseException] = None,
+        dead_letter_id: Optional[str] = None,
+    ) -> OutcomeContext:
+        traceback_text = None
+        if exc is not None and exc.__traceback__ is not None:
+            traceback_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+        return OutcomeContext(
+            event=event,
+            message=item.delivery.message,
+            queue_name=item.delivery.queue_name,
+            actor_name=item.actor.actor_name,
+            attempt=record.attempt,
+            max_retries=record.max_retries,
+            execution_mode=record.execution_mode,
+            worker_id=self.worker_id,
+            worker_revision=self.worker_revision,
+            result=result,
+            failure_kind=failure_kind,
+            exception_type=None if exc is None else type(exc).__name__,
+            exception_message=None if exc is None else str(exc),
+            traceback_text=traceback_text,
+            retry_delay_ms=record.retry_delay_ms,
+            dead_letter_id=dead_letter_id,
+        )
+
+    async def _dispatch_actor_callback(self, target: Any, payload: dict[str, Any]) -> None:
+        if isinstance(target, str):
+            target_actor = self.broker.get_actor(target)
+            await target_actor.send(payload)
+            return
+
+        if hasattr(target, "send") and callable(target.send):
+            await target.send(payload)
+            return
+
+        raise TypeError(f"Callback actor target must be an actor name or Actor instance, got {type(target)!r}.")
+
+    async def _dispatch_inprocess_callback(self, target: Any, context: Any) -> None:
+        result = target(context)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _invoke_callbacks(self, targets: list[Any], *, context: Any, actor_payload: Optional[dict[str, Any]]) -> None:
+        for target in targets:
+            try:
+                if callable(target) and not isinstance(target, str):
+                    await self._dispatch_inprocess_callback(target, context)
+                else:
+                    if actor_payload is None:
+                        raise TypeError("Actor callback payload is not available for this callback.")
+                    await self._dispatch_actor_callback(target, actor_payload)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                logger.exception("Fluxera callback %r failed.", target)
+
+    async def _emit_outcome_callbacks(
+        self,
+        item: _ScheduledDelivery,
+        record: TaskRecord,
+        *,
+        event: str,
+        option_name: str,
+        result: Any = None,
+        failure_kind: Optional[FailureKind] = None,
+        exc: Optional[BaseException] = None,
+        dead_letter_id: Optional[str] = None,
+    ) -> None:
+        targets = self._callback_targets(item.actor, item.delivery, option_name)
+        if not targets:
+            return
+        context = self._build_outcome_context(
+            item,
+            record,
+            event=event,
+            result=result,
+            failure_kind=failure_kind,
+            exc=exc,
+            dead_letter_id=dead_letter_id,
+        )
+        await self._invoke_callbacks(targets, context=context, actor_payload=context.to_dict())
+
+    async def _emit_dead_letter_callbacks(self, item: _ScheduledDelivery, record: DeadLetterRecord) -> None:
+        targets = self._callback_targets(item.actor, item.delivery, "on_dead_lettered")
+        if not targets:
+            return
+        context = DeadLetterContext(record=record)
+        await self._invoke_callbacks(targets, context=context, actor_payload=context.to_dict())
+
+    async def _emit_dead_letter_related_callbacks(
+        self,
+        item: _ScheduledDelivery,
+        record: TaskRecord,
+        dead_letter_record: Optional[DeadLetterRecord],
+    ) -> None:
+        if dead_letter_record is None:
+            return
+        await self._emit_dead_letter_callbacks(item, dead_letter_record)
 
     async def _handle_failure(
         self,
@@ -843,8 +1006,31 @@ class Worker:
         *,
         failure_kind: FailureKind,
     ) -> None:
-        retry_policy = self._resolve_retry_policy(actor, item.delivery)
-        should_retry = self._should_retry(record, retry_policy, exc, failure_kind=failure_kind)
+        try:
+            retry_policy = self._resolve_retry_policy(actor, item.delivery)
+            should_retry = self._should_retry(record, retry_policy, exc, failure_kind=failure_kind)
+        except Exception as policy_exc:
+            record.final_action = "reject"
+            self._attach_dead_letter_record(
+                item,
+                actor,
+                record,
+                exc=policy_exc,
+                failure_kind="invalid_configuration",
+            )
+            await item.consumer.reject(item.delivery, requeue=False)
+            dead_letter_record = item.delivery.metadata.get("dead_letter_record")
+            await self._emit_outcome_callbacks(
+                item,
+                record,
+                event="failure",
+                option_name="on_failure",
+                failure_kind="invalid_configuration",
+                exc=policy_exc,
+                dead_letter_id=None if dead_letter_record is None else dead_letter_record.dead_letter_id,
+            )
+            await self._emit_dead_letter_related_callbacks(item, record, dead_letter_record)
+            return
 
         if should_retry:
             retry_delay_ms = self._compute_retry_delay_ms(record, retry_policy)
@@ -852,6 +1038,9 @@ class Worker:
                 item.delivery.message.copy(
                     options={
                         "attempt": record.attempt + 1,
+                        "retries": record.attempt + 1,
+                        "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                        "requeue_timestamp": current_millis(),
                     }
                 ),
                 delay=retry_delay_ms / 1000 if retry_delay_ms > 0 else None,
@@ -860,11 +1049,48 @@ class Worker:
             record.retry_delay_ms = retry_delay_ms
             record.final_action = "retry"
             await item.consumer.ack(item.delivery)
+            await self._emit_outcome_callbacks(
+                item,
+                record,
+                event="failure",
+                option_name="on_failure",
+                failure_kind=failure_kind,
+                exc=exc,
+            )
+            await self._emit_outcome_callbacks(
+                item,
+                record,
+                event="retry_scheduled",
+                option_name="on_retry_scheduled",
+                failure_kind=failure_kind,
+                exc=exc,
+            )
             return
 
         record.final_action = "reject"
         self._attach_dead_letter_record(item, actor, record, exc=exc, failure_kind=failure_kind)
         await item.consumer.reject(item.delivery, requeue=False)
+        dead_letter_record = item.delivery.metadata.get("dead_letter_record")
+        dead_letter_id = None if dead_letter_record is None else dead_letter_record.dead_letter_id
+        await self._emit_outcome_callbacks(
+            item,
+            record,
+            event="failure",
+            option_name="on_failure",
+            failure_kind=failure_kind,
+            exc=exc,
+            dead_letter_id=dead_letter_id,
+        )
+        await self._emit_outcome_callbacks(
+            item,
+            record,
+            event="retry_exhausted",
+            option_name="on_retry_exhausted",
+            failure_kind=failure_kind,
+            exc=exc,
+            dead_letter_id=dead_letter_id,
+        )
+        await self._emit_dead_letter_related_callbacks(item, record, dead_letter_record)
 
     async def _handle_cancellation(self, item, actor, record: TaskRecord) -> None:
         on_cancel = item.delivery.options.get("on_cancel", actor.options.get("on_cancel", "requeue"))
@@ -883,6 +1109,18 @@ class Worker:
                 failure_kind="cancel_reject",
             )
             await item.consumer.reject(item.delivery, requeue=False)
+            dead_letter_record = item.delivery.metadata.get("dead_letter_record")
+            dead_letter_id = None if dead_letter_record is None else dead_letter_record.dead_letter_id
+            await self._emit_outcome_callbacks(
+                item,
+                record,
+                event="failure",
+                option_name="on_failure",
+                failure_kind="cancel_reject",
+                exc=record.exception,
+                dead_letter_id=dead_letter_id,
+            )
+            await self._emit_dead_letter_related_callbacks(item, record, dead_letter_record)
             return
 
         if on_cancel == "requeue":
@@ -900,6 +1138,15 @@ class Worker:
         *,
         failure_kind: FailureKind,
     ) -> bool:
+        if retry_policy.throws is not None and isinstance(exc, retry_policy.throws):
+            return False
+
+        if retry_policy.retry_when is not None:
+            should_retry = retry_policy.retry_when(record.attempt, exc, record)
+            if not isinstance(should_retry, bool):
+                raise ValueError("retry_when must return a boolean value.")
+            return should_retry
+
         if record.attempt >= retry_policy.max_retries:
             return False
 
@@ -915,8 +1162,14 @@ class Worker:
         if retry_policy.min_backoff_ms == 0:
             return 0
 
-        delay_ms = retry_policy.min_backoff_ms * (2**record.attempt)
-        return min(delay_ms, retry_policy.max_backoff_ms)
+        base_delay_ms = retry_policy.min_backoff_ms * (2**record.attempt)
+        if retry_policy.jitter == "none":
+            return min(base_delay_ms, retry_policy.max_backoff_ms)
+
+        delay_ms = int(base_delay_ms * random.uniform(1.0, 2.0))
+        if delay_ms > retry_policy.max_backoff_ms:
+            return int(retry_policy.max_backoff_ms * random.uniform(0.5, 1.0))
+        return delay_ms
 
     def _attach_terminal_dead_letter(
         self,

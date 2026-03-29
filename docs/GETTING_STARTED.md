@@ -191,6 +191,88 @@ health checks pass.
 
 For the full model and rollout lifecycle, see [REVISION_MANAGEMENT.md](REVISION_MANAGEMENT.md).
 
+## Retry And Callback Examples
+
+Fluxera now supports Dramatiq-style retry controls and Fluxera-native callback
+hooks.
+
+### Retry policy
+
+```python
+import fluxera
+
+
+broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15", namespace="retry-example")
+
+
+def retry_when(attempt: int, exc: BaseException, record: fluxera.TaskRecord) -> bool:
+    del record
+    return attempt < 2 and not isinstance(exc, ValueError)
+
+
+@fluxera.actor(
+    broker=broker,
+    queue_name="default",
+    max_retries=5,
+    min_backoff=15_000,
+    max_backoff=300_000,
+    jitter="full",
+    retry_when=retry_when,
+    throws=(ValueError,),
+)
+async def call_upstream(job_id: str) -> None:
+    raise RuntimeError(f"temporary failure for {job_id}")
+```
+
+What these options do:
+
+- `max_retries`: upper bound for retry attempts when no predicate overrides it
+- `min_backoff` / `max_backoff`: exponential retry window in milliseconds
+- `jitter="full"`: spreads retries to avoid synchronized retry bursts
+- `retry_when`: predicate-based retry control using `attempt`, `exception`, and `TaskRecord`
+- `throws`: exceptions that should skip retries and move straight to terminal handling
+
+### Callback hooks
+
+Callbacks come in two forms:
+
+- in-process sync/async callables for logging, tracing, and telemetry
+- actor-name callbacks for queue-based follow-up work
+
+```python
+import fluxera
+
+
+broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15", namespace="callback-example")
+
+
+def on_success(context: fluxera.OutcomeContext) -> None:
+    print("done", context.actor_name, context.result)
+
+
+async def on_failure(context: fluxera.OutcomeContext) -> None:
+    print("failed", context.failure_kind, context.exception_type)
+
+
+@fluxera.actor(broker=broker, queue_name="callbacks")
+async def notify_retry_exhausted(payload: dict[str, object]) -> None:
+    print("dead letter id", payload["dead_letter_id"])
+
+
+@fluxera.actor(
+    broker=broker,
+    queue_name="default",
+    on_success=on_success,
+    on_failure=on_failure,
+    on_retry_exhausted="notify_retry_exhausted",
+)
+async def generate_summary() -> dict[str, str]:
+    return {"status": "ok"}
+```
+
+Use callback actors when the follow-up should itself be durable and queued.
+Use callable hooks when the follow-up is local telemetry, logging, or tracing.
+
 ## Distributed Concurrency Limits
 
 Use `ConcurrentRateLimiter` when only one worker, or a small fixed number of
@@ -275,7 +357,7 @@ These cover:
 
 ## Current Limits
 
-`0.0.8` is an early alpha, so a few edges are still intentionally narrow:
+`0.0.9` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet
