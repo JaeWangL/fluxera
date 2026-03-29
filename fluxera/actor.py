@@ -48,6 +48,13 @@ class Actor:
     def message(self, *args: Any, **kwargs: Any) -> Message:
         return self.message_with_options(args=args, kwargs=kwargs)
 
+    def _default_message_options(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in self.options.items()
+            if _is_message_option_compatible(value)
+        }
+
     def message_with_options(
         self,
         *,
@@ -60,7 +67,7 @@ class Actor:
             actor_name=self.actor_name,
             args=args,
             kwargs=(kwargs or {}).copy(),
-            options={**self.options, **options},
+            options={**self._default_message_options(), **options},
         )
 
     async def send(self, *args: Any, **kwargs: Any) -> Message:
@@ -174,3 +181,16 @@ def actor(
         return decorator
 
     return decorator(fn)
+
+
+def _is_message_option_compatible(value: Any) -> bool:
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return True
+
+    if isinstance(value, (list, tuple)):
+        return all(_is_message_option_compatible(item) for item in value)
+
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_message_option_compatible(item) for key, item in value.items())
+
+    return False

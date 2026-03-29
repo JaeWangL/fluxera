@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import fluxera
+from fluxera.encoder import JSONMessageEncoder
 
 
 class ActorTests(unittest.IsolatedAsyncioTestCase):
@@ -34,11 +35,16 @@ class ActorTests(unittest.IsolatedAsyncioTestCase):
         message = noop.send_sync()
         self.assertEqual(message.actor_name, "noop")
 
-    def test_actor_message_with_options_merges_actor_defaults(self) -> None:
+    def test_actor_message_with_options_keeps_serializable_defaults_only(self) -> None:
         broker = fluxera.StubBroker()
         fluxera.set_broker(broker)
 
-        @fluxera.actor(queue_name="jobs", max_retries=2)
+        @fluxera.actor(
+            queue_name="jobs",
+            max_retries=2,
+            throws=(ValueError,),
+            retry_for=(RuntimeError,),
+        )
         async def noop() -> None:
             return None
 
@@ -46,3 +52,6 @@ class ActorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.queue_name, "jobs")
         self.assertEqual(message.options["max_retries"], 2)
         self.assertEqual(message.options["timeout"], 25)
+        self.assertNotIn("throws", message.options)
+        self.assertNotIn("retry_for", message.options)
+        self.assertIsInstance(JSONMessageEncoder().dumps(message), bytes)

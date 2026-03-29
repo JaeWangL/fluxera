@@ -131,6 +131,16 @@ Fluxera uses `spawn` as the default process start method so the process lane is 
 
 Fluxera ships with a small admin CLI for queue revision control:
 
+Set a worker revision explicitly for real rollouts:
+
+```bash
+export FLUXERA_WORKER_REVISION=20260329153000
+```
+
+`worker_revision` should come from deployment metadata such as a release id, git SHA, image digest, or timestamp-based rollout id. Fluxera does not generate this automatically for production rollouts because every worker from the same deployment should agree on exactly the same revision string.
+
+Then read or promote the queue `serving_revision`:
+
 ```bash
 fluxera revision get \
   --redis-url redis://127.0.0.1:6379/15 \
@@ -146,6 +156,8 @@ fluxera revision promote \
 ```
 
 Use `--format json` when the command is being called by deployment automation.
+
+For the full model and rollout lifecycle, see [REVISION_MANAGEMENT.md](REVISION_MANAGEMENT.md).
 
 ## Deduplication And Idempotency
 
@@ -195,7 +207,7 @@ These cover:
 
 ## Current Limits
 
-`0.0.1` is an early alpha, so a few edges are still intentionally narrow:
+`0.0.2` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet
