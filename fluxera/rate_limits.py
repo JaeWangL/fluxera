@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Iterator
 
@@ -8,6 +9,13 @@ import redis
 import redis.asyncio as redis_async
 
 from .errors import RateLimitExceeded
+
+
+def _default_ttl_ms() -> int:
+    raw_value = os.getenv("WORKER_CONCURRENCY_LOCK_TTL_MS")
+    if raw_value is None:
+        return 2 * 60 * 60 * 1000
+    return max(int(raw_value), 1)
 
 
 class ConcurrentRateLimiter:
@@ -59,7 +67,7 @@ class ConcurrentRateLimiter:
         key: str,
         *,
         limit: int = 1,
-        ttl: int = 900_000,
+        ttl: int | None = None,
         ttl_ms: int | None = None,
         prefix: str = "fluxera:concurrency",
     ) -> None:
@@ -76,7 +84,10 @@ class ConcurrentRateLimiter:
 
         self.client = resolved_client
         self.limit = int(limit)
-        self.ttl_ms = max(int(ttl_ms if ttl_ms is not None else ttl), 1)
+        resolved_ttl_ms = ttl_ms
+        if resolved_ttl_ms is None:
+            resolved_ttl_ms = _default_ttl_ms() if ttl is None else ttl
+        self.ttl_ms = max(int(resolved_ttl_ms), 1)
         self.key = f"{prefix}:{key}" if prefix else key
 
     @property

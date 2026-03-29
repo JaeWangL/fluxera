@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.0.3` is the current public alpha.
+`0.0.6` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -63,6 +63,30 @@ async def main() -> None:
 
 asyncio.run(main())
 ```
+
+## Worker CLI
+
+Fluxera can now start workers directly from the CLI, similar to the way
+projects used `dramatiq ...` before.
+
+If your project has:
+
+- a setup module that creates and registers a broker
+- a worker registry that lists actor modules
+
+you can run it like this:
+
+```bash
+fluxera worker \
+  your_project.fluxera_setup \
+  --module-registry your_project.worker_registry:WORKER_MODULES \
+  --broker your_project.fluxera_setup:broker \
+  --uvloop \
+  --concurrency 64 \
+  --thread-concurrency 8
+```
+
+For smoke tests and one-shot local runs, add `--exit-when-idle`.
 
 ## Execution Model
 
@@ -150,6 +174,30 @@ with limiter.acquire(raise_on_failure=False) as acquired:
 
 Use `aacquire()` when the limiter is created from an async Redis client or a
 `fluxera.RedisBroker`.
+
+The default limiter TTL is now aligned with the previous production wrappers:
+`2 hours`, or `WORKER_CONCURRENCY_LOCK_TTL_MS` when that environment variable
+is set.
+
+The limiter can also be used from the CLI.
+
+Probe a key without holding it:
+
+```bash
+fluxera rate-limit probe \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --key report:123 \
+  --format json
+```
+
+Run a command under a distributed mutex:
+
+```bash
+fluxera rate-limit run \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --key report:123 \
+  -- python3 scripts/generate_report.py
+```
 
 ## Benchmark Snapshot
 

@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import io
+import json
+import importlib
+import sys
+import tempfile
+import unittest
+from contextlib import contextmanager
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from uuid import uuid4
+
+import redis
+
+import fluxera
+from fluxera.cli import main
+
+
+class FluxeraCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.redis_url = "redis://127.0.0.1:6379/15"
+        self.client = redis.Redis.from_url(self.redis_url)
+        self.test_keys: list[str] = []
+
+        try:
+            self.client.ping()
+        except Exception as exc:
+            self.client.close()
+            self.skipTest(f"Redis is not available for CLI tests: {exc}")
+
+    def tearDown(self) -> None:
+        if self.test_keys:
+            self.client.delete(*self.test_keys)
+        self.client.close()
+
+    def unique_key(self) -> str:
+        key = f"fluxera:cli:test:{uuid4().hex}"
+        self.test_keys.append(key)
+        return key
+
+    @contextmanager
+    def temporary_import_path(self, path: Path):
+        inserted = False
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+            inserted = True
+        try:
+            yield
+        finally:
+            if inserted:
+                sys.path.remove(path_str)
+
+    def test_rate_limit_probe_reports_acquired_and_busy(self) -> None:
+        key = self.unique_key()
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "rate-limit",
+                    "probe",
+                    "--redis-url",
+                    self.redis_url,
+                    "--key",
+                    key,
+                    "--prefix",
+                    "",
+                    "--format",
+                    "json",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["acquired"])
+        self.assertEqual(payload["requested_key"], key)
+        self.assertEqual(payload["key"], key)
+
+        limiter = fluxera.ConcurrentRateLimiter(self.client, key, prefix="", limit=1, ttl_ms=1000)
+        stdout = io.StringIO()
+        with limiter.acquire():
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "rate-limit",
+                        "probe",
+                        "--redis-url",
+                        self.redis_url,
+                        "--key",
+                        key,
+                        "--prefix",
+                        "",
+                        "--format",
+                        "json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 3)
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["acquired"])
+
+    def test_rate_limit_run_executes_command_under_lock(self) -> None:
+        key = self.unique_key()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker_path = Path(temp_dir) / "marker.txt"
+            exit_code = main(
+                [
+                    "rate-limit",
+                    "run",
+                    "--redis-url",
+                    self.redis_url,
+                    "--key",
+                    key,
+                    "--prefix",
+                    "",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker_path)!r}).write_text('ok', encoding='utf-8')",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(marker_path.read_text(encoding="utf-8"), "ok")
+
+    def test_rate_limit_run_returns_busy_exit_code_without_running_command(self) -> None:
+        key = self.unique_key()
+        limiter = fluxera.ConcurrentRateLimiter(self.client, key, prefix="", limit=1, ttl_ms=1000)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker_path = Path(temp_dir) / "marker.txt"
+            stderr = io.StringIO()
+            with limiter.acquire():
+                with redirect_stderr(stderr):
+                    exit_code = main(
+                        [
+                            "rate-limit",
+                            "run",
+                            "--redis-url",
+                            self.redis_url,
+                            "--key",
+                            key,
+                            "--prefix",
+                            "",
+                            "--",
+                            sys.executable,
+                            "-c",
+                            f"from pathlib import Path; Path({str(marker_path)!r}).write_text('should-not-run', encoding='utf-8')",
+                        ]
+                    )
+
+            self.assertEqual(exit_code, 3)
+            self.assertFalse(marker_path.exists())
+            self.assertIn("busy:", stderr.getvalue())
+
+    def test_worker_command_runs_stub_broker_app_from_module_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_dir = Path(temp_dir) / "cli_worker_app"
+            package_dir.mkdir()
+            (package_dir / "__init__.py").write_text("", encoding="utf-8")
+            marker_path = package_dir / "marker.txt"
+
+            (package_dir / "app_setup.py").write_text(
+                "\n".join(
+                    [
+                        "import fluxera",
+                        "",
+                        "broker = fluxera.StubBroker()",
+                        "fluxera.set_broker(broker)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (package_dir / "workers.py").write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "",
+                        "import fluxera",
+                        "from cli_worker_app.app_setup import broker",
+                        "",
+                        "@fluxera.actor(broker=broker, queue_name='default')",
+                        "async def write_marker(path: str) -> None:",
+                        "    Path(path).write_text('ok', encoding='utf-8')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (package_dir / "worker_registry.py").write_text(
+                "WORKER_MODULES = ['cli_worker_app.workers']\n",
+                encoding="utf-8",
+            )
+
+            with self.temporary_import_path(Path(temp_dir)):
+                app_setup = importlib.import_module("cli_worker_app.app_setup")
+                workers = importlib.import_module("cli_worker_app.workers")
+                workers.write_marker.send_sync(str(marker_path))
+
+                exit_code = main(
+                    [
+                        "worker",
+                        "cli_worker_app.app_setup",
+                        "--module-registry",
+                        "cli_worker_app.worker_registry:WORKER_MODULES",
+                        "--broker",
+                        "cli_worker_app.app_setup:broker",
+                        "--process-concurrency",
+                        "0",
+                        "--exit-when-idle",
+                    ]
+                )
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(marker_path.read_text(encoding="utf-8"), "ok")
+
+                # Avoid leaking the temporary package into later tests.
+                for module_name in [
+                    "cli_worker_app.workers",
+                    "cli_worker_app.worker_registry",
+                    "cli_worker_app.app_setup",
+                    "cli_worker_app",
+                ]:
+                    sys.modules.pop(module_name, None)
+                import fluxera.broker as broker_module
+
+                broker_module.global_broker = None

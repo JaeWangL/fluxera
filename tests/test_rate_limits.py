@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from uuid import uuid4
 
@@ -99,3 +100,21 @@ class ConcurrentRateLimiterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             with limiter.acquire():
                 self.fail("sync acquire should not accept redis.asyncio clients")
+
+    def test_default_ttl_uses_legacy_two_hour_baseline_and_env_override(self) -> None:
+        key = self.unique_key()
+        previous = os.environ.get("WORKER_CONCURRENCY_LOCK_TTL_MS")
+
+        try:
+            os.environ.pop("WORKER_CONCURRENCY_LOCK_TTL_MS", None)
+            limiter = fluxera.ConcurrentRateLimiter(self.sync_client, key, prefix="")
+            self.assertEqual(limiter.ttl_ms, 2 * 60 * 60 * 1000)
+
+            os.environ["WORKER_CONCURRENCY_LOCK_TTL_MS"] = "12345"
+            overridden = fluxera.ConcurrentRateLimiter(self.sync_client, key, prefix="")
+            self.assertEqual(overridden.ttl_ms, 12345)
+        finally:
+            if previous is None:
+                os.environ.pop("WORKER_CONCURRENCY_LOCK_TTL_MS", None)
+            else:
+                os.environ["WORKER_CONCURRENCY_LOCK_TTL_MS"] = previous

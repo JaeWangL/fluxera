@@ -30,6 +30,30 @@ python3 -m unittest discover -s tests -v
 
 The local Docker Compose file starts Redis on `127.0.0.1:6379`.
 
+## Running A Worker From The CLI
+
+Fluxera can import a setup module plus a worker-module registry and start the
+worker directly from the CLI.
+
+Example:
+
+```bash
+fluxera worker \
+  your_project.fluxera_setup \
+  --module-registry your_project.worker_registry:WORKER_MODULES \
+  --broker your_project.fluxera_setup:broker \
+  --uvloop \
+  --concurrency 64 \
+  --thread-concurrency 8
+```
+
+Useful flags:
+
+- `--queue NAME`: restrict the worker to one queue
+- `--process-concurrency 0`: disable the process lane explicitly
+- `--exit-when-idle`: drain current work and exit
+- `--worker-revision REVISION`: set rollout revision explicitly
+
 ## Your First Async Actor
 
 ```python
@@ -159,6 +183,42 @@ Use `--format json` when the command is being called by deployment automation.
 
 For the full model and rollout lifecycle, see [REVISION_MANAGEMENT.md](REVISION_MANAGEMENT.md).
 
+## Distributed Concurrency Limits
+
+Use `ConcurrentRateLimiter` when only one worker, or a small fixed number of
+workers, should enter the same logical section at once.
+
+```python
+import redis
+
+import fluxera
+
+
+client = redis.Redis.from_url("redis://127.0.0.1:6379/15")
+limiter = fluxera.ConcurrentRateLimiter(client, "report:123", limit=1)
+
+with limiter.acquire(raise_on_failure=False) as acquired:
+    if not acquired:
+        print("already running elsewhere")
+```
+
+The default TTL is `2 hours`, or `WORKER_CONCURRENCY_LOCK_TTL_MS` if that
+environment variable is set.
+
+The same limiter can be used from the CLI for scripts and operational tooling:
+
+```bash
+fluxera rate-limit probe \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --key report:123 \
+  --format json
+
+fluxera rate-limit run \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --key report:123 \
+  -- python3 scripts/generate_report.py
+```
+
 ## Deduplication And Idempotency
 
 Fluxera separates three ideas:
@@ -207,7 +267,7 @@ These cover:
 
 ## Current Limits
 
-`0.0.3` is an early alpha, so a few edges are still intentionally narrow:
+`0.0.6` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet
