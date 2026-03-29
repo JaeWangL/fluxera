@@ -27,3 +27,7 @@ class RemoteExecutionError(WorkerError):
     def __init__(self, message: str, *, traceback_text: str | None = None) -> None:
         super().__init__(message)
         self.traceback_text = traceback_text
+
+
+class RateLimitExceeded(FluxeraError):
+    """Raised when a rate limiter cannot acquire a slot."""

@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.0.2` is the current public alpha.
+`0.0.3` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -127,6 +127,29 @@ Use `--format json` when the command is called by deployment automation.
 - Deduplication is an enqueue-time admission policy, not exactly-once execution.
 - Effectively-once side effects require idempotency keys or application-level dedupe.
 - Redis workers renew leases for long-running tasks and reclaim stale pending deliveries.
+
+## Distributed Concurrency Limits
+
+Fluxera now ships a Redis-backed `ConcurrentRateLimiter` for application-level
+distributed mutexes and small concurrency caps.
+
+```python
+import redis
+
+import fluxera
+
+
+client = redis.Redis.from_url("redis://127.0.0.1:6379/15")
+limiter = fluxera.ConcurrentRateLimiter(client, "report:123", limit=1)
+
+with limiter.acquire(raise_on_failure=False) as acquired:
+    if not acquired:
+        return
+    print("exclusive section")
+```
+
+Use `aacquire()` when the limiter is created from an async Redis client or a
+`fluxera.RedisBroker`.
 
 ## Benchmark Snapshot
 
