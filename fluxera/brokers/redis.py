@@ -6,10 +6,12 @@ import time
 from typing import Optional
 from uuid import uuid4
 
+import orjson
 import redis.asyncio as redis
 from redis.exceptions import ResponseError, WatchError
 
 from ..broker import Broker, Consumer, Delivery
+from ..dead_letters import DeadLetterRecord, coerce_dead_letter_record
 from ..encoder import JSONMessageEncoder, MessageEncoder
 from ..errors import QueueNotFound
 from ..message import Message
@@ -37,6 +39,7 @@ class RedisBroker(Broker):
         pending_scan_size: int = 256,
         consumer_name_prefix: str = "fluxera",
         message_ttl_seconds: float = 86_400.0,
+        dead_letter_ttl_seconds: float = 604_800.0,
         encoder: Optional[MessageEncoder] = None,
     ) -> None:
         super().__init__()
@@ -49,6 +52,7 @@ class RedisBroker(Broker):
         self.pending_scan_size = max(int(pending_scan_size), 1)
         self.consumer_name_prefix = consumer_name_prefix
         self.message_ttl_seconds = max(float(message_ttl_seconds), self.lease_seconds, 1.0)
+        self.dead_letter_ttl_seconds = max(float(dead_letter_ttl_seconds), 1.0)
         self.encoder = encoder or JSONMessageEncoder()
         self.client = redis.from_url(url, decode_responses=False)
         self.scripts = RedisLuaScripts(self.client)
@@ -56,6 +60,10 @@ class RedisBroker(Broker):
     @property
     def message_ttl_ms(self) -> int:
         return max(int(self.message_ttl_seconds * 1000), 1)
+
+    @property
+    def dead_letter_ttl_ms(self) -> int:
+        return max(int(self.dead_letter_ttl_seconds * 1000), 1)
 
     def _declare_queue(self, queue_name: str) -> None:
         del queue_name
@@ -76,7 +84,10 @@ class RedisBroker(Broker):
         return f"{self.namespace}:delayed:{queue_name}"
 
     def _dead_letter_key(self, queue_name: str) -> str:
-        return f"{self.namespace}:dead:{queue_name}"
+        return f"{self.namespace}:dlq:{queue_name}"
+
+    def _dead_letter_record_key(self, dead_letter_id: str) -> str:
+        return f"{self.namespace}:dlq:record:{dead_letter_id}"
 
     def _message_key_prefix(self) -> str:
         return f"{self.namespace}:message:"
@@ -103,6 +114,40 @@ class RedisBroker(Broker):
 
     def _decode_message(self, payload: bytes) -> Message:
         return self.encoder.loads(payload)
+
+    def _encode_dead_letter_record(self, record: DeadLetterRecord) -> bytes:
+        return orjson.dumps(record.to_dict())
+
+    def _decode_dead_letter_record(self, payload: bytes) -> DeadLetterRecord:
+        return DeadLetterRecord.from_dict(orjson.loads(payload))
+
+    def _dead_letter_record_ttl_ms(self, record: DeadLetterRecord, *, now_ms: Optional[int] = None) -> int:
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+
+        if record.retention_deadline_ms is None:
+            record.retention_deadline_ms = now_ms + self.dead_letter_ttl_ms
+            return self.dead_letter_ttl_ms
+
+        return max(int(record.retention_deadline_ms) - now_ms, 1)
+
+    def _queue_dead_letter_record_commands(self, pipe, record: DeadLetterRecord, *, now_ms: Optional[int] = None) -> None:
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+
+        ttl_ms = self._dead_letter_record_ttl_ms(record, now_ms=now_ms)
+        pipe.set(self._dead_letter_record_key(record.dead_letter_id), self._encode_dead_letter_record(record), px=ttl_ms)
+        pipe.zadd(self._dead_letter_key(record.queue_name), {record.dead_letter_id: int(record.dead_lettered_at_ms)})
+        pipe.pexpire(self._dead_letter_key(record.queue_name), ttl_ms)
+
+    def _update_dead_letter_record_commands(self, pipe, record: DeadLetterRecord, *, now_ms: Optional[int] = None) -> None:
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+
+        ttl_ms = self._dead_letter_record_ttl_ms(record, now_ms=now_ms)
+        pipe.set(self._dead_letter_record_key(record.dead_letter_id), self._encode_dead_letter_record(record), px=ttl_ms)
+        pipe.zrem(self._dead_letter_key(record.queue_name), record.dead_letter_id)
+        pipe.pexpire(self._dead_letter_key(record.queue_name), ttl_ms)
 
     def _normalize_deduplication(self, message: Message) -> tuple[str, str, int, bool, bool]:
         options = message.options
@@ -360,27 +405,100 @@ class RedisBroker(Broker):
             consumer_name=self._consumer_name(queue_name),
         )
 
-    async def get_dead_letters(self, queue_name: str) -> list[Message]:
-        message_ids = await self.client.lrange(self._dead_letter_key(queue_name), 0, -1)
-        if not message_ids:
+    async def get_dead_letter_records(self, queue_name: str) -> list[DeadLetterRecord]:
+        dead_letter_ids = await self.client.zrange(self._dead_letter_key(queue_name), 0, -1)
+        if not dead_letter_ids:
             return []
 
-        payloads = await self.client.mget(*[self._message_key(_decode_message_id(message_id)) for message_id in message_ids])
-        messages: list[Message] = []
+        payloads = await self.client.mget(
+            *[self._dead_letter_record_key(_decode_message_id(dead_letter_id)) for dead_letter_id in dead_letter_ids]
+        )
+        records: list[DeadLetterRecord] = []
         for payload in payloads:
             if payload is None:
                 continue
-            messages.append(self._decode_message(payload))
+            records.append(self._decode_dead_letter_record(payload))
+        return records
+
+    async def get_dead_letter_record(self, queue_name: str, dead_letter_id: str) -> Optional[DeadLetterRecord]:
+        payload = await self.client.get(self._dead_letter_record_key(dead_letter_id))
+        if payload is None:
+            return None
+
+        record = self._decode_dead_letter_record(payload)
+        if record.queue_name != queue_name:
+            return None
+        return record
+
+    async def get_dead_letters(self, queue_name: str) -> list[Message]:
+        messages: list[Message] = []
+        for record in await self.get_dead_letter_records(queue_name):
+            message = record.to_message()
+            if message is not None:
+                messages.append(message)
         return messages
+
+    async def requeue_dead_letter(
+        self,
+        queue_name: str,
+        dead_letter_id: str,
+        *,
+        note: Optional[str] = None,
+    ) -> Optional[DeadLetterRecord]:
+        record = await self.get_dead_letter_record(queue_name, dead_letter_id)
+        if record is None or record.resolution_state != "active":
+            return record
+
+        message = record.to_message()
+        if message is None:
+            raise ValueError("Dead letter record does not contain a message snapshot and cannot be requeued.")
+
+        await self.send(message)
+        now_ms = int(time.time() * 1000)
+        record.resolution_state = "requeued"
+        record.resolved_at_ms = now_ms
+        record.resolution_note = note
+
+        pipe = self.client.pipeline()
+        self._update_dead_letter_record_commands(pipe, record, now_ms=now_ms)
+        await pipe.execute()
+        return record
+
+    async def purge_dead_letter(
+        self,
+        queue_name: str,
+        dead_letter_id: str,
+        *,
+        note: Optional[str] = None,
+    ) -> Optional[DeadLetterRecord]:
+        record = await self.get_dead_letter_record(queue_name, dead_letter_id)
+        if record is None or record.resolution_state != "active":
+            return record
+
+        now_ms = int(time.time() * 1000)
+        record.resolution_state = "purged"
+        record.resolved_at_ms = now_ms
+        record.resolution_note = note
+
+        pipe = self.client.pipeline()
+        self._update_dead_letter_record_commands(pipe, record, now_ms=now_ms)
+        await pipe.execute()
+        return record
 
     async def flush(self, queue_name: str) -> None:
         if queue_name not in self.queues:
             raise QueueNotFound(queue_name)
 
+        dead_letter_ids = await self.client.zrange(self._dead_letter_key(queue_name), 0, -1)
+        dead_letter_record_keys = [
+            self._dead_letter_record_key(_decode_message_id(dead_letter_id))
+            for dead_letter_id in dead_letter_ids
+        ]
         await self.client.delete(
             self._stream_key(queue_name),
             self._delayed_key(queue_name),
             self._dead_letter_key(queue_name),
+            *dead_letter_record_keys,
         )
 
     async def join(self, queue_name: str) -> None:
@@ -471,14 +589,56 @@ class _RedisConsumer(Consumer):
         payloads = await self.broker.client.mget(*[self.broker._message_key(message_id) for message_id in message_ids])
 
         deliveries: list[Delivery] = []
-        missing_transport_ids: list[str] = []
+        dead_letter_records: list[DeadLetterRecord] = []
         for (entry_id, _fields), message_id, payload in zip(entries, message_ids, payloads):
             transport_id = _decode_stream_id(entry_id)
             if payload is None:
-                missing_transport_ids.append(transport_id)
+                now_ms = int(time.time() * 1000)
+                dead_letter_records.append(
+                    DeadLetterRecord(
+                        namespace=self.broker.namespace,
+                        queue_name=self.queue_name,
+                        actor_name="<unknown>",
+                        message_id=message_id,
+                        delivery_id=transport_id,
+                        failure_kind="integrity_missing_payload",
+                        message_snapshot=None,
+                        payload_available=False,
+                        execution_mode="unknown",
+                        exception_message=f"Missing payload for message_id={message_id}.",
+                        dead_lettered_at_ms=now_ms,
+                        worker_id=None,
+                        worker_revision=None,
+                        consumer_name=self.consumer_name,
+                    )
+                )
                 continue
 
-            message = self.broker._decode_message(payload)
+            try:
+                message = self.broker._decode_message(payload)
+            except BaseException as exc:
+                now_ms = int(time.time() * 1000)
+                dead_letter_records.append(
+                    DeadLetterRecord(
+                        namespace=self.broker.namespace,
+                        queue_name=self.queue_name,
+                        actor_name="<unknown>",
+                        message_id=message_id,
+                        delivery_id=transport_id,
+                        failure_kind="integrity_decode_error",
+                        message_snapshot=None,
+                        payload_available=True,
+                        execution_mode="unknown",
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc),
+                        dead_lettered_at_ms=now_ms,
+                        worker_id=None,
+                        worker_revision=None,
+                        consumer_name=self.consumer_name,
+                    )
+                )
+                continue
+
             delivery = Delivery(
                 message=message,
                 redelivered=redelivered,
@@ -495,9 +655,14 @@ class _RedisConsumer(Consumer):
             deliveries.append(delivery)
             self.active_ids.add(transport_id)
 
-        if missing_transport_ids:
+        if dead_letter_records:
+            now_ms = int(time.time() * 1000)
             pipe = self.broker.client.pipeline()
-            for transport_id in missing_transport_ids:
+            for record in dead_letter_records:
+                self.broker._queue_dead_letter_record_commands(pipe, record, now_ms=now_ms)
+                transport_id = record.delivery_id
+                if transport_id is None:
+                    continue
                 pipe.xack(self.stream_key, self.broker.group_name, transport_id)
                 pipe.xdel(self.stream_key, transport_id)
             await pipe.execute()
@@ -580,7 +745,19 @@ class _RedisConsumer(Consumer):
         pipe.xdel(self.stream_key, delivery.transport_id)
 
         if not requeue:
-            pipe.rpush(self.dead_letter_key, delivery.message.message_id)
+            record = coerce_dead_letter_record(
+                delivery.metadata.get("dead_letter_record"),
+                namespace=self.broker.namespace,
+                queue_name=self.queue_name,
+                actor_name=delivery.actor_name,
+                message=delivery.message,
+                delivery_id=delivery.transport_id,
+                consumer_name=self.consumer_name,
+                failure_kind="operator_reject",
+                execution_mode=delivery.metadata.get("execution_mode", "async"),
+                retention_deadline_ms=int(time.time() * 1000) + self.broker.dead_letter_ttl_ms,
+            )
+            self.broker._queue_dead_letter_record_commands(pipe, record)
 
         await pipe.execute()
         self.active_ids.discard(delivery.transport_id)

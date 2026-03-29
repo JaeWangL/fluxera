@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from .admin import (
+    DeadLetterList,
+    DeadLetterResolution,
+    DeadLetterStatus,
+    get_dead_letter,
+    list_dead_letters,
+    purge_dead_letter,
+    requeue_dead_letter,
     ServingRevisionPromotion,
     ServingRevisionStatus,
     ensure_serving_revision,
@@ -9,6 +16,7 @@ from .admin import (
 )
 from .actor import Actor, actor
 from .broker import Broker, Consumer, Delivery, get_broker, set_broker
+from .dead_letters import DeadLetterRecord
 from .encoder import JSONMessageEncoder, PickleMessageEncoder
 from .errors import RateLimitExceeded
 from .brokers.redis import RedisBroker
@@ -22,6 +30,10 @@ __all__ = [
     "Broker",
     "Consumer",
     "ConcurrentRateLimiter",
+    "DeadLetterRecord",
+    "DeadLetterList",
+    "DeadLetterResolution",
+    "DeadLetterStatus",
     "Delivery",
     "JSONMessageEncoder",
     "Message",
@@ -35,8 +47,12 @@ __all__ = [
     "Worker",
     "actor",
     "ensure_serving_revision",
+    "get_dead_letter",
     "get_broker",
+    "list_dead_letters",
     "get_serving_revision",
     "promote_serving_revision",
+    "purge_dead_letter",
+    "requeue_dead_letter",
     "set_broker",
 ]

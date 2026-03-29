@@ -181,6 +181,14 @@ fluxera revision promote \
 
 Use `--format json` when the command is being called by deployment automation.
 
+Fluxera does not auto-promote `serving_revision` at core runtime startup.
+That separation is intentional so canaries, staggered rollouts, and partial
+queue cutovers do not switch traffic too early.
+
+If your application uses a simple homogeneous rollout, your deploy entrypoint
+may run `fluxera revision promote ...` automatically after workers start and
+health checks pass.
+
 For the full model and rollout lifecycle, see [REVISION_MANAGEMENT.md](REVISION_MANAGEMENT.md).
 
 ## Distributed Concurrency Limits
@@ -267,7 +275,7 @@ These cover:
 
 ## Current Limits
 
-`0.0.6` is an early alpha, so a few edges are still intentionally narrow:
+`0.0.8` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet
@@ -277,5 +285,6 @@ These cover:
 ## Where To Go Next
 
 - [System Design](SYSTEM_DESIGN.md)
+- [Dead Letter and Retry](DLQ.md)
 - [Deduplication and Idempotency](DEDUP_IDEMPOTENCY.md)
 - [Redis Lua Contract](REDIS_LUA_CONTRACT.md)

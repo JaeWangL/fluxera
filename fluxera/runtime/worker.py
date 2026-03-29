@@ -13,7 +13,9 @@ from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
 
 from ..broker import Broker, Consumer, Delivery
+from ..dead_letters import DeadLetterRecord, FailureKind
 from ..errors import ActorNotFound, RemoteExecutionError, WorkerError
+from ..message import current_millis
 
 if TYPE_CHECKING:
     from ..actor import Actor
@@ -68,6 +70,11 @@ class TaskRecord:
     admitted_at: Optional[float] = None
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+    received_at_ms: int = 0
+    admitted_at_ms: Optional[int] = None
+    started_at_ms: Optional[int] = None
+    finished_at_ms: Optional[int] = None
+    failed_at_ms: Optional[int] = None
     lease_deadline: Optional[float] = None
     result: Any = None
     exception: Optional[BaseException] = None
@@ -536,11 +543,24 @@ class Worker:
                 try:
                     actor = self.broker.get_actor(delivery.actor_name)
                 except ActorNotFound:
+                    self._attach_terminal_dead_letter(
+                        delivery,
+                        actor_name=delivery.actor_name,
+                        failure_kind="invalid_configuration",
+                        exception_message=f"Actor {delivery.actor_name!r} is not registered.",
+                    )
                     await consumer.reject(delivery, requeue=False)
                     continue
 
                 ready_queue = self.ready_queues.get(actor.execution)
                 if ready_queue is None:
+                    self._attach_terminal_dead_letter(
+                        delivery,
+                        actor_name=actor.actor_name,
+                        failure_kind="invalid_configuration",
+                        execution_mode=actor.execution,
+                        exception_message=f"Execution lane {actor.execution!r} is not enabled for this worker.",
+                    )
                     await consumer.reject(delivery, requeue=False)
                     continue
 
@@ -589,6 +609,7 @@ class Worker:
 
                 record = self._build_task_record(item.actor, item.delivery)
                 record.admitted_at = time.perf_counter()
+                record.admitted_at_ms = current_millis()
                 record.state = "admitted"
                 self.records[item.delivery.message_id] = record
                 self.record_history[item.delivery.message_id].append(record)
@@ -620,6 +641,7 @@ class Worker:
         try:
             record.state = "running"
             record.started_at = time.perf_counter()
+            record.started_at_ms = current_millis()
 
             if record.timeout_ms is None:
                 record.result = await item.actor.run(*item.delivery.args, worker=self, **item.delivery.kwargs)
@@ -633,22 +655,26 @@ class Worker:
         except TimeoutError as exc:
             record.state = "timed_out"
             record.exception = exc
+            record.failed_at_ms = current_millis()
             await self._handle_failure(item, item.actor, record, exc, failure_kind="timeout")
         except asyncio.CancelledError as exc:
             record.state = "cancelled"
             record.exception = exc
             record.cancel_reason = "worker_shutdown" if self._stopping else "external_cancel"
+            record.failed_at_ms = current_millis()
             await self._handle_cancellation(item, item.actor, record)
             raise
         except BaseException as exc:
             record.state = "failed"
             record.exception = exc
+            record.failed_at_ms = current_millis()
             await self._handle_failure(item, item.actor, record, exc, failure_kind="exception")
         finally:
             if lease_task is not None:
                 lease_task.cancel()
                 await asyncio.gather(lease_task, return_exceptions=True)
             record.finished_at = time.perf_counter()
+            record.finished_at_ms = current_millis()
             if lane_permit is not None:
                 lane_permit.release()
             if actor_permit is not None:
@@ -743,6 +769,7 @@ class Worker:
             execution_mode=actor.execution,
             timeout_ms=timeout_ms,
             received_at=time.perf_counter(),
+            received_at_ms=current_millis(),
             lease_deadline=delivery.lease_deadline,
         )
 
@@ -807,7 +834,15 @@ class Worker:
             retry_on_timeout=bool(retry_on_timeout),
         )
 
-    async def _handle_failure(self, item, actor, record: TaskRecord, exc: BaseException, *, failure_kind: str) -> None:
+    async def _handle_failure(
+        self,
+        item,
+        actor,
+        record: TaskRecord,
+        exc: BaseException,
+        *,
+        failure_kind: FailureKind,
+    ) -> None:
         retry_policy = self._resolve_retry_policy(actor, item.delivery)
         should_retry = self._should_retry(record, retry_policy, exc, failure_kind=failure_kind)
 
@@ -828,6 +863,7 @@ class Worker:
             return
 
         record.final_action = "reject"
+        self._attach_dead_letter_record(item, actor, record, exc=exc, failure_kind=failure_kind)
         await item.consumer.reject(item.delivery, requeue=False)
 
     async def _handle_cancellation(self, item, actor, record: TaskRecord) -> None:
@@ -839,6 +875,13 @@ class Worker:
 
         if on_cancel == "reject":
             record.final_action = "reject"
+            self._attach_dead_letter_record(
+                item,
+                actor,
+                record,
+                exc=record.exception,
+                failure_kind="cancel_reject",
+            )
             await item.consumer.reject(item.delivery, requeue=False)
             return
 
@@ -855,7 +898,7 @@ class Worker:
         retry_policy: RetryPolicy,
         exc: BaseException,
         *,
-        failure_kind: str,
+        failure_kind: FailureKind,
     ) -> bool:
         if record.attempt >= retry_policy.max_retries:
             return False
@@ -874,3 +917,98 @@ class Worker:
 
         delay_ms = retry_policy.min_backoff_ms * (2**record.attempt)
         return min(delay_ms, retry_policy.max_backoff_ms)
+
+    def _attach_terminal_dead_letter(
+        self,
+        delivery: Delivery,
+        *,
+        actor_name: str,
+        failure_kind: FailureKind,
+        execution_mode: str = "async",
+        exception_message: Optional[str] = None,
+    ) -> None:
+        namespace = getattr(self.broker, "namespace", self.broker.__class__.__name__.lower())
+        now_ms = current_millis()
+        retention_deadline_ms = self._dead_letter_retention_deadline(now_ms)
+        record = DeadLetterRecord.from_message(
+            delivery.message,
+            namespace=namespace,
+            queue_name=delivery.queue_name,
+            actor_name=actor_name,
+            delivery_id=delivery.transport_id,
+            failure_kind=failure_kind,
+            execution_mode=execution_mode,
+            exception_message=exception_message,
+            dead_lettered_at_ms=now_ms,
+            worker_id=self.worker_id,
+            worker_revision=self.worker_revision,
+            consumer_name=delivery.metadata.get("consumer_name"),
+            retention_deadline_ms=retention_deadline_ms,
+        )
+        delivery.metadata["dead_letter_record"] = record
+        delivery.metadata["execution_mode"] = execution_mode
+
+    def _attach_dead_letter_record(
+        self,
+        item: _ScheduledDelivery,
+        actor,
+        record: TaskRecord,
+        *,
+        exc: Optional[BaseException],
+        failure_kind: FailureKind,
+    ) -> None:
+        now_ms = current_millis()
+        retention_deadline_ms = self._dead_letter_retention_deadline(now_ms)
+        exception_type = None if exc is None else type(exc).__name__
+        exception_message = None if exc is None else str(exc)
+        traceback_text = None
+        if exc is not None and exc.__traceback__ is not None:
+            traceback_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+        deduplication_id = None
+        raw_deduplication = item.delivery.options.get("deduplication")
+        if isinstance(raw_deduplication, dict):
+            raw_id = raw_deduplication.get("id")
+            if raw_id not in {None, ""}:
+                deduplication_id = str(raw_id)
+        if deduplication_id is None:
+            raw_job_id = item.delivery.options.get("job_id")
+            if raw_job_id not in {None, ""}:
+                deduplication_id = str(raw_job_id)
+
+        namespace = getattr(self.broker, "namespace", self.broker.__class__.__name__.lower())
+        dead_letter_record = DeadLetterRecord.from_message(
+            item.delivery.message,
+            namespace=namespace,
+            queue_name=item.delivery.queue_name,
+            actor_name=actor.actor_name,
+            delivery_id=item.delivery.transport_id,
+            failure_kind=failure_kind,
+            attempt=record.attempt,
+            max_retries=record.max_retries,
+            timeout_ms=record.timeout_ms,
+            execution_mode=record.execution_mode,
+            exception_type=exception_type,
+            exception_message=exception_message,
+            traceback_text=traceback_text,
+            cancel_reason=record.cancel_reason,
+            retry_delay_ms=record.retry_delay_ms,
+            dead_lettered_at_ms=now_ms,
+            received_at_ms=record.received_at_ms,
+            started_at_ms=record.started_at_ms,
+            failed_at_ms=record.failed_at_ms or now_ms,
+            worker_id=self.worker_id,
+            worker_revision=self.worker_revision,
+            consumer_name=item.delivery.metadata.get("consumer_name"),
+            deduplication_id=deduplication_id,
+            idempotency_key=item.delivery.options.get("idempotency_key"),
+            retention_deadline_ms=retention_deadline_ms,
+        )
+        item.delivery.metadata["dead_letter_record"] = dead_letter_record
+        item.delivery.metadata["execution_mode"] = record.execution_mode
+
+    def _dead_letter_retention_deadline(self, now_ms: int) -> Optional[int]:
+        ttl_ms = getattr(self.broker, "dead_letter_ttl_ms", None)
+        if ttl_ms is None:
+            return None
+        return now_ms + int(ttl_ms)

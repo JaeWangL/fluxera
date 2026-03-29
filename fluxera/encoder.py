@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import base64
-import json
 import pickle
 from dataclasses import asdict
 from typing import Protocol
+
+import orjson
 
 from .message import Message
 
@@ -21,35 +22,18 @@ class JSONMessageEncoder:
     """JSON encoder for trusted message primitives."""
 
     def dumps(self, message: Message) -> bytes:
-        payload = self._encode_message(message)
-        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        payload = encode_message_snapshot(message)
+        return orjson.dumps(payload)
 
     def loads(self, payload: bytes) -> Message:
-        raw = json.loads(payload.decode("utf-8"))
-        return self._decode_message(raw)
+        raw = orjson.loads(payload)
+        return decode_message_snapshot(raw)
 
     def _encode_message(self, message: Message) -> dict[str, object]:
-        data = asdict(message)
-        return {
-            "queue_name": data["queue_name"],
-            "actor_name": data["actor_name"],
-            "args": self._encode_value(data["args"]),
-            "kwargs": self._encode_value(data["kwargs"]),
-            "options": self._encode_value(data["options"]),
-            "message_id": data["message_id"],
-            "message_timestamp": data["message_timestamp"],
-        }
+        return encode_message_snapshot(message)
 
     def _decode_message(self, data: dict[str, object]) -> Message:
-        return Message(
-            queue_name=str(data["queue_name"]),
-            actor_name=str(data["actor_name"]),
-            args=tuple(self._decode_value(data["args"])),
-            kwargs=dict(self._decode_value(data["kwargs"])),
-            options=dict(self._decode_value(data["options"])),
-            message_id=str(data["message_id"]),
-            message_timestamp=int(data["message_timestamp"]),
-        )
+        return decode_message_snapshot(data)
 
     def _encode_value(self, value):
         if value is None or isinstance(value, (bool, int, float, str)):
@@ -102,3 +86,30 @@ class PickleMessageEncoder:
         if not isinstance(message, Message):
             raise TypeError(f"Expected a Message payload, got {type(message)!r}.")
         return message
+
+
+def encode_message_snapshot(message: Message) -> dict[str, object]:
+    data = asdict(message)
+    encoder = JSONMessageEncoder()
+    return {
+        "queue_name": data["queue_name"],
+        "actor_name": data["actor_name"],
+        "args": encoder._encode_value(data["args"]),
+        "kwargs": encoder._encode_value(data["kwargs"]),
+        "options": encoder._encode_value(data["options"]),
+        "message_id": data["message_id"],
+        "message_timestamp": data["message_timestamp"],
+    }
+
+
+def decode_message_snapshot(data: dict[str, object]) -> Message:
+    encoder = JSONMessageEncoder()
+    return Message(
+        queue_name=str(data["queue_name"]),
+        actor_name=str(data["actor_name"]),
+        args=tuple(encoder._decode_value(data["args"])),
+        kwargs=dict(encoder._decode_value(data["kwargs"])),
+        options=dict(encoder._decode_value(data["options"])),
+        message_id=str(data["message_id"]),
+        message_timestamp=int(data["message_timestamp"]),
+    )

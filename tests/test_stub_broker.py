@@ -183,6 +183,8 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertLess(elapsed, 0.12)
         self.assertEqual(len(broker.dead_letters), 1)
+        self.assertEqual(broker.dead_letters[0].failure_kind, "timeout")
+        self.assertEqual(broker.dead_letters[0].actor_name, "slow_process")
         fast_records = [record for record in worker.records.values() if record.delivery.actor_name == "fast_process"]
         self.assertEqual(len(fast_records), 1)
         self.assertNotEqual(fast_records[0].result, os.getpid())
@@ -256,6 +258,9 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(attempts, 2)
         self.assertEqual(len(broker.dead_letters), 1)
+        self.assertEqual(broker.dead_letters[0].failure_kind, "timeout")
+        self.assertEqual(broker.dead_letters[0].attempt, 1)
+        self.assertEqual(broker.dead_letters[0].max_retries, 1)
         latest_record = worker.records[next(iter(worker.records))]
         self.assertEqual(latest_record.attempt, 1)
         self.assertEqual(latest_record.final_action, "reject")

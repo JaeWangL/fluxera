@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import multiprocessing as mp
 import os
 import subprocess
@@ -9,6 +8,7 @@ import sys
 import unittest
 from uuid import uuid4
 
+import orjson
 import redis as sync_redis
 import redis.asyncio as redis_async
 
@@ -365,7 +365,7 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "json",
         )
         self.assertEqual(get_result.returncode, 0, get_result.stderr)
-        get_payload = json.loads(get_result.stdout)
+        get_payload = orjson.loads(get_result.stdout)
         self.assertEqual(get_payload["serving_revision"], "rev-a")
         self.assertTrue(get_payload["exists"])
 
@@ -386,7 +386,7 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "json",
         )
         self.assertEqual(promote_result.returncode, 0, promote_result.stderr)
-        promote_payload = json.loads(promote_result.stdout)
+        promote_payload = orjson.loads(promote_result.stdout)
         self.assertTrue(promote_payload["updated"])
         self.assertEqual(promote_payload["serving_revision"], "rev-b")
         self.assertEqual(await broker.get_serving_revision("default"), "rev-b")
@@ -408,7 +408,7 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "json",
         )
         self.assertEqual(failed_promote.returncode, 2, failed_promote.stderr)
-        failed_payload = json.loads(failed_promote.stdout)
+        failed_payload = orjson.loads(failed_promote.stdout)
         self.assertFalse(failed_payload["updated"])
         self.assertEqual(failed_payload["serving_revision"], "rev-b")
 
@@ -612,10 +612,89 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         await consumer.reject(deliveries[0], requeue=False)
         await broker.join(actor.queue_name)
+        dead_letter_records = await broker.get_dead_letter_records(actor.queue_name)
         dead_letters = await broker.get_dead_letters(actor.queue_name)
 
+        self.assertEqual(len(dead_letter_records), 1)
         self.assertEqual(len(dead_letters), 1)
+        self.assertEqual(dead_letter_records[0].failure_kind, "operator_reject")
+        self.assertEqual(dead_letter_records[0].actor_name, actor.actor_name)
+        self.assertEqual(dead_letter_records[0].message_id, deliveries[0].message_id)
         self.assertEqual(dead_letters[0].message_id, deliveries[0].message_id)
+        await consumer.close()
+
+    async def test_dead_letter_records_can_be_requeued_and_purged(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, actor_name="admin_me", queue_name="default")
+        async def noop(value: str) -> str:
+            return value
+
+        await noop.send("first")
+        consumer = await broker.open_consumer(noop.queue_name)
+        first_delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+        await consumer.reject(first_delivery, requeue=False)
+
+        records = await broker.get_dead_letter_records(noop.queue_name)
+        self.assertEqual(len(records), 1)
+        first_dead_letter_id = records[0].dead_letter_id
+
+        requeued = await broker.requeue_dead_letter(noop.queue_name, first_dead_letter_id, note="retry once")
+        self.assertIsNotNone(requeued)
+        assert requeued is not None
+        self.assertEqual(requeued.resolution_state, "requeued")
+        self.assertEqual(requeued.resolution_note, "retry once")
+        self.assertEqual(await broker.get_dead_letter_records(noop.queue_name), [])
+
+        second_consumer = await broker.open_consumer(noop.queue_name)
+        requeued_delivery = (await second_consumer.receive(limit=1, timeout=1.0))[0]
+        self.assertEqual(requeued_delivery.message_id, first_delivery.message_id)
+        await second_consumer.ack(requeued_delivery)
+        await broker.join(noop.queue_name)
+
+        await noop.send("second")
+        second_delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+        await consumer.reject(second_delivery, requeue=False)
+        records = await broker.get_dead_letter_records(noop.queue_name)
+        self.assertEqual(len(records), 1)
+        second_dead_letter_id = records[0].dead_letter_id
+
+        purged = await broker.purge_dead_letter(noop.queue_name, second_dead_letter_id, note="drop permanently")
+        self.assertIsNotNone(purged)
+        assert purged is not None
+        self.assertEqual(purged.resolution_state, "purged")
+        self.assertEqual(purged.resolution_note, "drop permanently")
+        self.assertEqual(await broker.get_dead_letter_records(noop.queue_name), [])
+
+        fetched = await broker.get_dead_letter_record(noop.queue_name, second_dead_letter_id)
+        self.assertIsNotNone(fetched)
+        assert fetched is not None
+        self.assertEqual(fetched.resolution_state, "purged")
+
+        await second_consumer.close()
+        await consumer.close()
+
+    async def test_missing_message_payload_moves_delivery_to_integrity_dead_letter(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, actor_name="integrity_test", queue_name="default")
+        async def noop() -> None:
+            return None
+
+        message = await noop.send()
+        await self.redis.delete(broker._message_key(message.message_id))
+
+        consumer = await broker.open_consumer(noop.queue_name)
+        deliveries = await consumer.receive(limit=1, timeout=1.0)
+        self.assertEqual(deliveries, [])
+
+        records = await broker.get_dead_letter_records(noop.queue_name)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].failure_kind, "integrity_missing_payload")
+        self.assertEqual(records[0].message_id, message.message_id)
+        self.assertFalse(records[0].payload_available)
+
+        self.assertEqual(await self.redis.xlen(broker._stream_key(noop.queue_name)), 0)
         await consumer.close()
 
     async def test_at_least_once_recovers_after_worker_process_crash(self) -> None:

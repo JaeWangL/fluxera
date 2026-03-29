@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
-import json
 import os
 import signal
 import subprocess
@@ -11,10 +10,20 @@ import sys
 from collections.abc import Iterable
 from typing import Any
 
+import orjson
 import redis
 
-from .admin import ensure_serving_revision, get_serving_revision, promote_serving_revision
+from .admin import (
+    ensure_serving_revision,
+    get_dead_letter,
+    get_serving_revision,
+    list_dead_letters,
+    promote_serving_revision,
+    purge_dead_letter,
+    requeue_dead_letter,
+)
 from .broker import Broker, get_broker
+from .dead_letters import DeadLetterRecord
 from .rate_limits import ConcurrentRateLimiter
 from .runtime.worker import Worker
 
@@ -43,6 +52,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require the current serving revision to match before promoting.",
     )
     promote_parser.set_defaults(handler=_handle_revision_promote)
+
+    dlq_parser = subparsers.add_parser("dlq", help="Inspect and manage dead letters.")
+    dlq_subparsers = dlq_parser.add_subparsers(dest="dlq_command", required=True)
+
+    dlq_list_parser = dlq_subparsers.add_parser("list", help="List active dead letters for a queue.")
+    _add_dlq_target_arguments(dlq_list_parser)
+    dlq_list_parser.set_defaults(handler=_handle_dlq_list)
+
+    dlq_get_parser = dlq_subparsers.add_parser("get", help="Get a specific dead letter record.")
+    _add_dlq_target_arguments(dlq_get_parser)
+    dlq_get_parser.add_argument("--dead-letter-id", required=True, help="Dead letter record id.")
+    dlq_get_parser.set_defaults(handler=_handle_dlq_get)
+
+    dlq_requeue_parser = dlq_subparsers.add_parser("requeue", help="Requeue a dead letter back onto its queue.")
+    _add_dlq_target_arguments(dlq_requeue_parser)
+    dlq_requeue_parser.add_argument("--dead-letter-id", required=True, help="Dead letter record id.")
+    dlq_requeue_parser.add_argument("--note", help="Optional resolution note.")
+    dlq_requeue_parser.set_defaults(handler=_handle_dlq_requeue)
+
+    dlq_purge_parser = dlq_subparsers.add_parser("purge", help="Mark a dead letter as purged and remove it from the active DLQ.")
+    _add_dlq_target_arguments(dlq_purge_parser)
+    dlq_purge_parser.add_argument("--dead-letter-id", required=True, help="Dead letter record id.")
+    dlq_purge_parser.add_argument("--note", help="Optional resolution note.")
+    dlq_purge_parser.set_defaults(handler=_handle_dlq_purge)
 
     worker_parser = subparsers.add_parser("worker", help="Run a Fluxera worker from imported modules.")
     worker_parser.add_argument(
@@ -194,6 +227,10 @@ def _add_revision_target_arguments(parser: argparse.ArgumentParser) -> None:
         )
 
 
+def _add_dlq_target_arguments(parser: argparse.ArgumentParser) -> None:
+    _add_revision_target_arguments(parser)
+
+
 def _int_env(name: str) -> int | None:
     raw_value = os.environ.get(name)
     if raw_value is None:
@@ -223,11 +260,29 @@ def _require_redis_url(args: argparse.Namespace) -> str:
 
 def _emit(args: argparse.Namespace, payload: dict[str, object]) -> None:
     if getattr(args, "format", "text") == "json":
-        print(json.dumps(payload, sort_keys=True))
+        print(orjson.dumps(payload, option=orjson.OPT_SORT_KEYS).decode("utf-8"))
         return
 
     for key, value in payload.items():
         print(f"{key}={value}")
+
+
+def _dead_letter_payload(record: DeadLetterRecord | None) -> dict[str, object] | None:
+    if record is None:
+        return None
+    payload = record.to_dict()
+    message_snapshot = payload.get("message_snapshot")
+    if isinstance(message_snapshot, dict):
+        payload["message_snapshot_present"] = True
+        payload["message_snapshot"] = {
+            "queue_name": message_snapshot.get("queue_name"),
+            "actor_name": message_snapshot.get("actor_name"),
+            "message_id": message_snapshot.get("message_id"),
+            "message_timestamp": message_snapshot.get("message_timestamp"),
+        }
+    else:
+        payload["message_snapshot_present"] = False
+    return payload
 
 
 def _add_rate_limit_arguments(parser: argparse.ArgumentParser, *, include_format: bool) -> None:
@@ -446,6 +501,88 @@ async def _handle_revision_promote(args: argparse.Namespace) -> int:
         },
     )
     return 0 if result.updated else 2
+
+
+async def _handle_dlq_list(args: argparse.Namespace) -> int:
+    listing = await list_dead_letters(
+        _require_redis_url(args),
+        namespace=args.namespace,
+        queue_name=args.queue,
+    )
+    _emit(
+        args,
+        {
+            "namespace": listing.namespace,
+            "queue": listing.queue_name,
+            "count": len(listing.records),
+            "items": [_dead_letter_payload(record) for record in listing.records],
+        },
+    )
+    return 0
+
+
+async def _handle_dlq_get(args: argparse.Namespace) -> int:
+    status = await get_dead_letter(
+        _require_redis_url(args),
+        namespace=args.namespace,
+        queue_name=args.queue,
+        dead_letter_id=args.dead_letter_id,
+    )
+    _emit(
+        args,
+        {
+            "namespace": status.namespace,
+            "queue": status.queue_name,
+            "dead_letter_id": args.dead_letter_id,
+            "exists": status.record is not None,
+            "record": _dead_letter_payload(status.record),
+        },
+    )
+    return 0 if status.record is not None else 4
+
+
+async def _handle_dlq_requeue(args: argparse.Namespace) -> int:
+    result = await requeue_dead_letter(
+        _require_redis_url(args),
+        namespace=args.namespace,
+        queue_name=args.queue,
+        dead_letter_id=args.dead_letter_id,
+        note=args.note,
+    )
+    _emit(
+        args,
+        {
+            "namespace": result.namespace,
+            "queue": result.queue_name,
+            "dead_letter_id": result.dead_letter_id,
+            "action": result.action,
+            "updated": result.updated,
+            "record": _dead_letter_payload(result.record),
+        },
+    )
+    return 0 if result.updated else 4
+
+
+async def _handle_dlq_purge(args: argparse.Namespace) -> int:
+    result = await purge_dead_letter(
+        _require_redis_url(args),
+        namespace=args.namespace,
+        queue_name=args.queue,
+        dead_letter_id=args.dead_letter_id,
+        note=args.note,
+    )
+    _emit(
+        args,
+        {
+            "namespace": result.namespace,
+            "queue": result.queue_name,
+            "dead_letter_id": result.dead_letter_id,
+            "action": result.action,
+            "updated": result.updated,
+            "record": _dead_letter_payload(result.record),
+        },
+    )
+    return 0 if result.updated else 4
 
 
 async def _handle_rate_limit_probe(args: argparse.Namespace) -> int:

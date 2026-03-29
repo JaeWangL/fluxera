@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fluxera"
-version = "0.0.6"
+version = "0.0.8"
 description = "Async-native message processing inspired by Dramatiq."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
+    "orjson>=3,<4",
     "redis>=5,<8",
 ]
 

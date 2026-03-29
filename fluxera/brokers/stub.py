@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ..broker import Broker, Consumer, Delivery
+from ..dead_letters import DeadLetterRecord, coerce_dead_letter_record
 from ..errors import QueueNotFound
-from ..message import Message
+from ..message import Message, current_millis
 
 
 @dataclass(slots=True)
@@ -22,15 +23,15 @@ class StubBroker(Broker):
     def __init__(self) -> None:
         super().__init__()
         self.queue_objects: dict[str, asyncio.Queue[_StubEntry]] = {}
-        self.dead_letters_by_queue: defaultdict[str, list[Message]] = defaultdict(list)
+        self.dead_letters_by_queue: defaultdict[str, list[DeadLetterRecord]] = defaultdict(list)
         self.delayed_tasks_by_queue: defaultdict[str, set[asyncio.Task[None]]] = defaultdict(set)
         self.serving_revisions: dict[str, str] = {}
         self.worker_revisions: dict[str, str] = {}
         self.worker_queue_states: dict[str, dict[str, str]] = {}
 
     @property
-    def dead_letters(self) -> list[Message]:
-        return [message for messages in self.dead_letters_by_queue.values() for message in messages]
+    def dead_letters(self) -> list[DeadLetterRecord]:
+        return [record for records in self.dead_letters_by_queue.values() for record in records]
 
     def _declare_queue(self, queue_name: str) -> None:
         self.queue_objects[queue_name] = asyncio.Queue()
@@ -133,6 +134,64 @@ class StubBroker(Broker):
             if not pending_delayed and queue.empty():
                 return
 
+    async def get_dead_letter_records(self, queue_name: str) -> list[DeadLetterRecord]:
+        return [
+            record
+            for record in self.dead_letters_by_queue[queue_name]
+            if record.resolution_state == "active"
+        ]
+
+    async def get_dead_letter_record(self, queue_name: str, dead_letter_id: str) -> Optional[DeadLetterRecord]:
+        for record in self.dead_letters_by_queue[queue_name]:
+            if record.dead_letter_id == dead_letter_id:
+                return record
+        return None
+
+    async def get_dead_letters(self, queue_name: str) -> list[Message]:
+        messages: list[Message] = []
+        for record in await self.get_dead_letter_records(queue_name):
+            message = record.to_message()
+            if message is not None:
+                messages.append(message)
+        return messages
+
+    async def requeue_dead_letter(
+        self,
+        queue_name: str,
+        dead_letter_id: str,
+        *,
+        note: Optional[str] = None,
+    ) -> Optional[DeadLetterRecord]:
+        record = await self.get_dead_letter_record(queue_name, dead_letter_id)
+        if record is None or record.resolution_state != "active":
+            return record
+
+        message = record.to_message()
+        if message is None:
+            raise ValueError("Dead letter record does not contain a message snapshot and cannot be requeued.")
+
+        await self.send(message)
+        record.resolution_state = "requeued"
+        record.resolved_at_ms = current_millis()
+        record.resolution_note = note
+        return record
+
+    async def purge_dead_letter(
+        self,
+        queue_name: str,
+        dead_letter_id: str,
+        *,
+        note: Optional[str] = None,
+    ) -> Optional[DeadLetterRecord]:
+        record = await self.get_dead_letter_record(queue_name, dead_letter_id)
+        if record is None or record.resolution_state != "active":
+            return record
+
+        record.resolution_state = "purged"
+        record.resolved_at_ms = current_millis()
+        record.resolution_note = note
+        return record
+
 
 class _StubConsumer(Consumer):
     def __init__(self, broker: StubBroker, queue_name: str) -> None:
@@ -174,6 +233,17 @@ class _StubConsumer(Consumer):
         if requeue:
             await self.queue.put(_StubEntry(delivery.message, redelivered=True))
         else:
-            self.broker.dead_letters_by_queue[self.queue_name].append(delivery.message)
+            record = coerce_dead_letter_record(
+                delivery.metadata.get("dead_letter_record"),
+                namespace="stub",
+                queue_name=self.queue_name,
+                actor_name=delivery.actor_name,
+                message=delivery.message,
+                delivery_id=delivery.transport_id,
+                consumer_name=None,
+                failure_kind="operator_reject",
+                execution_mode=delivery.metadata.get("execution_mode", "async"),
+            )
+            self.broker.dead_letters_by_queue[self.queue_name].append(record)
 
         self.queue.task_done()

@@ -181,6 +181,59 @@ serving_revision(default) = rev-new
 
 Rollback works the same way in reverse by promoting the older revision again.
 
+## 7.1 Why Fluxera Does Not Auto-Promote By Default
+
+Fluxera intentionally separates:
+
+- worker startup
+- serving revision promotion
+
+The runtime knows a worker's `worker_revision`.
+
+It does **not** know whether that revision is already healthy enough to become the
+serving revision for every queue it manages.
+
+Making promotion automatic at the core runtime level would be dangerous in
+several common rollout shapes:
+
+- canary rollout:
+  - one new worker starts for validation
+  - if Fluxera auto-promoted immediately, it would cut queue traffic over to the canary before the deployment is approved
+- partial queue rollout:
+  - one service image may contain workers for many queues
+  - some queues may be safe to cut over immediately while others still depend on warm caches, migrated data, or external side effects
+- staggered startup:
+  - the first new worker may start before the rest of the deployment is ready
+  - immediate promotion could move backlog to a revision with insufficient capacity
+- rollback window:
+  - a newly started revision may boot successfully but fail health checks or business smoke checks moments later
+  - automatic promotion would route work to it too early
+- mixed worker groups:
+  - different worker groups may intentionally be upgraded at different times
+  - a core auto-promote policy would collapse that distinction unless it became much more complex
+
+So Fluxera's default contract is:
+
+- startup decides `worker_revision`
+- control plane decides `serving_revision`
+
+That is why the public surface exposes explicit promotion methods and CLI commands.
+
+Application deploy entrypoints may still choose to auto-promote as a deployment
+policy.
+
+That is safe when all of the following are true:
+
+- the deployment is homogeneous for the targeted queues
+- the container or process is considered healthy before promotion runs
+- immediate cutover is acceptable for that environment
+- rollback can be handled by promoting the previous revision again
+
+In other words:
+
+- **Fluxera core default**: manual or automation-driven promotion outside the worker runtime
+- **application opt-in**: auto-promote inside a deploy entrypoint when the rollout shape is simple enough
+
 ## 8. Current Public Surface
 
 ### Worker

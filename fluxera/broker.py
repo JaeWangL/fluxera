@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
+from .dead_letters import DeadLetterRecord
 from .errors import ActorNotFound
 from .message import Message
 
@@ -105,6 +106,38 @@ class Broker(ABC):
 
     async def join(self, queue_name: str) -> None:
         raise NotImplementedError
+
+    async def get_dead_letters(self, queue_name: str) -> list[Message]:
+        del queue_name
+        return []
+
+    async def get_dead_letter_records(self, queue_name: str) -> list[DeadLetterRecord]:
+        del queue_name
+        return []
+
+    async def get_dead_letter_record(self, queue_name: str, dead_letter_id: str) -> Optional[DeadLetterRecord]:
+        del queue_name, dead_letter_id
+        return None
+
+    async def requeue_dead_letter(
+        self,
+        queue_name: str,
+        dead_letter_id: str,
+        *,
+        note: Optional[str] = None,
+    ) -> Optional[DeadLetterRecord]:
+        del queue_name, dead_letter_id, note
+        return None
+
+    async def purge_dead_letter(
+        self,
+        queue_name: str,
+        dead_letter_id: str,
+        *,
+        note: Optional[str] = None,
+    ) -> Optional[DeadLetterRecord]:
+        del queue_name, dead_letter_id, note
+        return None
 
     async def ensure_serving_revision(self, queue_name: str, worker_revision: str) -> str:
         del queue_name

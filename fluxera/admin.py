@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .brokers.redis import RedisBroker
+from .dead_letters import DeadLetterRecord
 
 
 @dataclass(slots=True)
@@ -22,6 +23,30 @@ class ServingRevisionPromotion:
     serving_revision: Optional[str]
     updated: bool
     expected_revision: Optional[str] = None
+
+
+@dataclass(slots=True)
+class DeadLetterStatus:
+    namespace: str
+    queue_name: str
+    record: Optional[DeadLetterRecord]
+
+
+@dataclass(slots=True)
+class DeadLetterList:
+    namespace: str
+    queue_name: str
+    records: list[DeadLetterRecord]
+
+
+@dataclass(slots=True)
+class DeadLetterResolution:
+    namespace: str
+    queue_name: str
+    dead_letter_id: str
+    action: str
+    updated: bool
+    record: Optional[DeadLetterRecord]
 
 
 async def get_serving_revision(
@@ -85,6 +110,87 @@ async def promote_serving_revision(
             serving_revision=serving_revision,
             updated=updated,
             expected_revision=expected_revision,
+        )
+    finally:
+        await broker.close()
+
+
+async def list_dead_letters(
+    redis_url: str,
+    *,
+    namespace: str,
+    queue_name: str,
+) -> DeadLetterList:
+    broker = RedisBroker(redis_url, namespace=namespace)
+    try:
+        return DeadLetterList(
+            namespace=namespace,
+            queue_name=queue_name,
+            records=await broker.get_dead_letter_records(queue_name),
+        )
+    finally:
+        await broker.close()
+
+
+async def get_dead_letter(
+    redis_url: str,
+    *,
+    namespace: str,
+    queue_name: str,
+    dead_letter_id: str,
+) -> DeadLetterStatus:
+    broker = RedisBroker(redis_url, namespace=namespace)
+    try:
+        return DeadLetterStatus(
+            namespace=namespace,
+            queue_name=queue_name,
+            record=await broker.get_dead_letter_record(queue_name, dead_letter_id),
+        )
+    finally:
+        await broker.close()
+
+
+async def requeue_dead_letter(
+    redis_url: str,
+    *,
+    namespace: str,
+    queue_name: str,
+    dead_letter_id: str,
+    note: Optional[str] = None,
+) -> DeadLetterResolution:
+    broker = RedisBroker(redis_url, namespace=namespace)
+    try:
+        record = await broker.requeue_dead_letter(queue_name, dead_letter_id, note=note)
+        return DeadLetterResolution(
+            namespace=namespace,
+            queue_name=queue_name,
+            dead_letter_id=dead_letter_id,
+            action="requeue",
+            updated=record is not None and record.resolution_state == "requeued",
+            record=record,
+        )
+    finally:
+        await broker.close()
+
+
+async def purge_dead_letter(
+    redis_url: str,
+    *,
+    namespace: str,
+    queue_name: str,
+    dead_letter_id: str,
+    note: Optional[str] = None,
+) -> DeadLetterResolution:
+    broker = RedisBroker(redis_url, namespace=namespace)
+    try:
+        record = await broker.purge_dead_letter(queue_name, dead_letter_id, note=note)
+        return DeadLetterResolution(
+            namespace=namespace,
+            queue_name=queue_name,
+            dead_letter_id=dead_letter_id,
+            action="purge",
+            updated=record is not None and record.resolution_state == "purged",
+            record=record,
         )
     finally:
         await broker.close()

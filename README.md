@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.0.6` is the current public alpha.
+`0.0.8` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -145,6 +145,11 @@ fluxera revision promote \
 
 Use `--format json` when the command is called by deployment automation.
 
+Fluxera does not auto-promote `serving_revision` at worker startup by default.
+That is intentional: startup only proves a worker booted, not that the new
+revision should already receive queue traffic. Simple deployments may still
+choose to auto-promote in their entrypoint or release automation.
+
 ## Delivery Semantics
 
 - Transport delivery is at-least-once.
@@ -235,6 +240,7 @@ The current release candidate was checked with:
 
 - [Getting Started](docs/GETTING_STARTED.md)
 - [Benchmark Results](docs/BENCHMARK.md)
+- [Dead Letter and Retry](docs/DLQ.md)
 - [Revision Management](docs/REVISION_MANAGEMENT.md)
 - [System Design](docs/SYSTEM_DESIGN.md)
 - [Deduplication and Idempotency](docs/DEDUP_IDEMPOTENCY.md)

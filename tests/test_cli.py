@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import io
-import json
 import importlib
 import sys
 import tempfile
 import unittest
+import asyncio
 from contextlib import contextmanager
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from uuid import uuid4
 
+import orjson
 import redis
 
 import fluxera
@@ -22,6 +23,7 @@ class FluxeraCliTests(unittest.TestCase):
         self.redis_url = "redis://127.0.0.1:6379/15"
         self.client = redis.Redis.from_url(self.redis_url)
         self.test_keys: list[str] = []
+        self.test_namespaces: list[str] = []
 
         try:
             self.client.ping()
@@ -32,12 +34,21 @@ class FluxeraCliTests(unittest.TestCase):
     def tearDown(self) -> None:
         if self.test_keys:
             self.client.delete(*self.test_keys)
+        for namespace in self.test_namespaces:
+            keys = list(self.client.scan_iter(match=f"{namespace}:*"))
+            if keys:
+                self.client.delete(*keys)
         self.client.close()
 
     def unique_key(self) -> str:
         key = f"fluxera:cli:test:{uuid4().hex}"
         self.test_keys.append(key)
         return key
+
+    def unique_namespace(self) -> str:
+        namespace = f"fluxera-cli-test-{uuid4().hex}"
+        self.test_namespaces.append(namespace)
+        return namespace
 
     @contextmanager
     def temporary_import_path(self, path: Path):
@@ -73,7 +84,7 @@ class FluxeraCliTests(unittest.TestCase):
             )
 
         self.assertEqual(exit_code, 0)
-        payload = json.loads(stdout.getvalue())
+        payload = orjson.loads(stdout.getvalue())
         self.assertTrue(payload["acquired"])
         self.assertEqual(payload["requested_key"], key)
         self.assertEqual(payload["key"], key)
@@ -98,7 +109,7 @@ class FluxeraCliTests(unittest.TestCase):
                 )
 
         self.assertEqual(exit_code, 3)
-        payload = json.loads(stdout.getvalue())
+        payload = orjson.loads(stdout.getvalue())
         self.assertFalse(payload["acquired"])
 
     def test_rate_limit_run_executes_command_under_lock(self) -> None:
@@ -226,3 +237,173 @@ class FluxeraCliTests(unittest.TestCase):
                 import fluxera.broker as broker_module
 
                 broker_module.global_broker = None
+
+    def test_dlq_commands_list_get_requeue_and_purge(self) -> None:
+        namespace = self.unique_namespace()
+
+        async def create_dead_letter(value: str) -> str:
+            broker = fluxera.RedisBroker(self.redis_url, namespace=namespace)
+
+            @fluxera.actor(broker=broker, actor_name="cli_dlq", queue_name="default")
+            async def noop(arg: str) -> str:
+                return arg
+
+            await noop.send(value)
+            consumer = await broker.open_consumer(noop.queue_name)
+            delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+            await consumer.reject(delivery, requeue=False)
+            records = await broker.get_dead_letter_records(noop.queue_name)
+            await consumer.close()
+            await broker.close()
+            return records[0].dead_letter_id
+
+        first_dead_letter_id = asyncio.run(create_dead_letter("first"))
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "dlq",
+                    "list",
+                    "--redis-url",
+                    self.redis_url,
+                    "--namespace",
+                    namespace,
+                    "--queue",
+                    "default",
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = orjson.loads(stdout.getvalue())
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["items"][0]["dead_letter_id"], first_dead_letter_id)
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "dlq",
+                    "get",
+                    "--redis-url",
+                    self.redis_url,
+                    "--namespace",
+                    namespace,
+                    "--queue",
+                    "default",
+                    "--dead-letter-id",
+                    first_dead_letter_id,
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = orjson.loads(stdout.getvalue())
+        self.assertTrue(payload["exists"])
+        self.assertEqual(payload["record"]["failure_kind"], "operator_reject")
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "dlq",
+                    "requeue",
+                    "--redis-url",
+                    self.redis_url,
+                    "--namespace",
+                    namespace,
+                    "--queue",
+                    "default",
+                    "--dead-letter-id",
+                    first_dead_letter_id,
+                    "--note",
+                    "retry from cli",
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = orjson.loads(stdout.getvalue())
+        self.assertTrue(payload["updated"])
+        self.assertEqual(payload["record"]["resolution_state"], "requeued")
+
+        async def drain_requeued_message() -> None:
+            broker = fluxera.RedisBroker(self.redis_url, namespace=namespace)
+            consumer = await broker.open_consumer("default")
+            delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+            await consumer.ack(delivery)
+            await broker.join("default")
+            await consumer.close()
+            await broker.close()
+
+        asyncio.run(drain_requeued_message())
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "dlq",
+                    "list",
+                    "--redis-url",
+                    self.redis_url,
+                    "--namespace",
+                    namespace,
+                    "--queue",
+                    "default",
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = orjson.loads(stdout.getvalue())
+        self.assertEqual(payload["count"], 0)
+
+        second_dead_letter_id = asyncio.run(create_dead_letter("second"))
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "dlq",
+                    "purge",
+                    "--redis-url",
+                    self.redis_url,
+                    "--namespace",
+                    namespace,
+                    "--queue",
+                    "default",
+                    "--dead-letter-id",
+                    second_dead_letter_id,
+                    "--note",
+                    "drop from cli",
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = orjson.loads(stdout.getvalue())
+        self.assertTrue(payload["updated"])
+        self.assertEqual(payload["record"]["resolution_state"], "purged")
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "dlq",
+                    "get",
+                    "--redis-url",
+                    self.redis_url,
+                    "--namespace",
+                    namespace,
+                    "--queue",
+                    "default",
+                    "--dead-letter-id",
+                    second_dead_letter_id,
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = orjson.loads(stdout.getvalue())
+        self.assertTrue(payload["exists"])
+        self.assertEqual(payload["record"]["resolution_state"], "purged")
