@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.0.9` is the current public alpha.
+`0.1.0` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -87,6 +87,20 @@ fluxera worker \
 ```
 
 For smoke tests and one-shot local runs, add `--exit-when-idle`.
+
+## Producer APIs
+
+Fluxera separates **message production** from **message execution**.
+
+- `actor.send(...)` and `actor.send_sync(...)` produce messages
+- worker execution lanes consume and execute those messages later
+
+This is why `send_sync()` is not the same thing as the worker thread lane.
+
+For `RedisBroker`, `send_sync()` now uses a real synchronous Redis producer
+path. It is safe for normal blocking contexts such as schedulers, CLI tools,
+and plain threads, but it still intentionally rejects calls made from inside an
+already-running event loop.
 
 ## Execution Model
 
@@ -313,6 +327,7 @@ The current release candidate was checked with:
 ## Documentation
 
 - [Getting Started](docs/GETTING_STARTED.md)
+- [FAQ](docs/FAQ.md)
 - [Benchmark Results](docs/BENCHMARK.md)
 - [Dead Letter and Retry](docs/DLQ.md)
 - [Revision Management](docs/REVISION_MANAGEMENT.md)

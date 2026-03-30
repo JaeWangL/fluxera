@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import subprocess
 import sys
+import threading
 import unittest
 from uuid import uuid4
 
@@ -157,6 +158,28 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(seen, ["alpha"])
         self.assertEqual(await broker.client.xlen(broker._stream_key(remember.queue_name)), 0)
+
+    async def test_send_sync_can_reuse_global_redis_broker_across_threads(self) -> None:
+        broker = self.make_broker()
+        errors: list[BaseException] = []
+
+        @fluxera.actor(broker=broker, queue_name="default")
+        async def remember(value: str) -> None:
+            del value
+
+        def send_once(index: int) -> None:
+            try:
+                remember.send_sync(f"value-{index}")
+            except BaseException as exc:
+                errors.append(exc)
+
+        for index in range(5):
+            thread = threading.Thread(target=send_once, args=(index,))
+            thread.start()
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(await broker.client.xlen(broker._stream_key(remember.queue_name)), 5)
 
     async def test_v2_key_layout_uses_message_registry_for_streams_and_delayed(self) -> None:
         broker = self.make_broker()

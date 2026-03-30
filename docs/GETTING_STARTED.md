@@ -94,6 +94,15 @@ What happens here:
 
 Fluxera does not force everything into a single execution model.
 
+One important distinction:
+
+- `actor.send()` and `actor.send_sync()` are **producer APIs**
+- `async`, `thread`, and `process` lanes are **worker execution lanes**
+
+That means `send_sync()` does not route work through the worker thread lane.
+It only enqueues a message. For `RedisBroker`, it now does that through a real
+synchronous Redis producer path.
+
 ### Sync actors
 
 Regular `def` actors default to the thread lane:
@@ -150,6 +159,11 @@ worker = fluxera.Worker(
 This lets long-running async I/O keep making progress while CPU work is isolated in subprocesses.
 
 Fluxera uses `spawn` as the default process start method so the process lane is safe to use from multithreaded workers. If you need a different policy for a specific deployment, pass `process_start_method=...` to `Worker(...)` or set `FLUXERA_PROCESS_START_METHOD`.
+
+If you are wondering why `send_sync()` still checks for an already-running
+event loop, see [FAQ.md](FAQ.md). The short version is that sync enqueue is
+allowed in blocking code, but intentionally rejected from inside async code so
+it does not stall the current event loop.
 
 ## Serving Revision Admin
 
@@ -357,7 +371,7 @@ These cover:
 
 ## Current Limits
 
-`0.0.9` is an early alpha, so a few edges are still intentionally narrow:
+`0.1.0` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet
@@ -367,6 +381,7 @@ These cover:
 ## Where To Go Next
 
 - [System Design](SYSTEM_DESIGN.md)
+- [FAQ](FAQ.md)
 - [Dead Letter and Retry](DLQ.md)
 - [Deduplication and Idempotency](DEDUP_IDEMPOTENCY.md)
 - [Redis Lua Contract](REDIS_LUA_CONTRACT.md)

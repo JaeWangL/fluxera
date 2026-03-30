@@ -90,9 +90,14 @@ class Actor:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.send(*args, **kwargs))
+            pass
+        else:
+            raise RuntimeError("send_sync cannot be called while an event loop is already running.")
 
-        raise RuntimeError("send_sync cannot be called while an event loop is already running.")
+        sync_sender = getattr(self.broker, "send_sync", None)
+        if callable(sync_sender):
+            return sync_sender(self.message(*args, **kwargs))
+        return asyncio.run(self.send(*args, **kwargs))
 
     def send_with_options_sync(
         self,
@@ -105,9 +110,17 @@ class Actor:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.send_with_options(args=args, kwargs=kwargs, delay=delay, **options))
+            pass
+        else:
+            raise RuntimeError("send_with_options_sync cannot be called while an event loop is already running.")
 
-        raise RuntimeError("send_with_options_sync cannot be called while an event loop is already running.")
+        sync_sender = getattr(self.broker, "send_sync", None)
+        if callable(sync_sender):
+            return sync_sender(
+                self.message_with_options(args=args, kwargs=kwargs, **options),
+                delay=delay,
+            )
+        return asyncio.run(self.send_with_options(args=args, kwargs=kwargs, delay=delay, **options))
 
     async def run(self, *args: Any, worker: Optional["Worker"] = None, **kwargs: Any) -> Any:
         if self.execution == "async":

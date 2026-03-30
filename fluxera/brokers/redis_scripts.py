@@ -201,6 +201,39 @@ class RedisLuaScripts:
         )
         return EnqueueDecision.from_response(response)
 
+    def enqueue_or_deduplicate_sync(
+        self,
+        *,
+        message_key_prefix: str,
+        stream_key: str,
+        delayed_key: str,
+        dedupe_key: str,
+        message_id: str,
+        encoded_message: bytes,
+        now_ms: int,
+        deliver_at_ms: int,
+        mode: str,
+        ttl_ms: int,
+        extend: bool,
+        replace: bool,
+        message_ttl_ms: int,
+    ) -> EnqueueDecision:
+        response = self._scripts["enqueue_or_deduplicate"](
+            keys=[message_key_prefix, stream_key, delayed_key, dedupe_key],
+            args=[
+                message_id,
+                encoded_message,
+                now_ms,
+                deliver_at_ms,
+                mode,
+                ttl_ms,
+                1 if extend else 0,
+                1 if replace else 0,
+                message_ttl_ms,
+            ],
+        )
+        return EnqueueDecision.from_response(response)
+
     async def promote_due(
         self,
         *,

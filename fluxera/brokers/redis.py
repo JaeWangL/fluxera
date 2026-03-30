@@ -7,6 +7,7 @@ from typing import Optional
 from uuid import uuid4
 
 import orjson
+import redis as sync_redis
 import redis.asyncio as redis
 from redis.exceptions import ResponseError, WatchError
 
@@ -55,7 +56,9 @@ class RedisBroker(Broker):
         self.dead_letter_ttl_seconds = max(float(dead_letter_ttl_seconds), 1.0)
         self.encoder = encoder or JSONMessageEncoder()
         self.client = redis.from_url(url, decode_responses=False)
+        self.sync_client = sync_redis.Redis.from_url(url, decode_responses=False)
         self.scripts = RedisLuaScripts(self.client)
+        self.sync_scripts = RedisLuaScripts(self.sync_client)
 
     @property
     def message_ttl_ms(self) -> int:
@@ -395,6 +398,41 @@ class RedisBroker(Broker):
             raise ValueError(f"Redis deduplication rejected message {message.message_id}: {decision.message_id}")
         return message
 
+    def send_sync(self, message: Message, *, delay: Optional[float] = None) -> Message:
+        self.declare_queue(message.queue_name)
+        now_ms = int(time.time() * 1000)
+        deliver_at_ms = 0
+        if delay is not None and delay > 0:
+            deliver_at_ms = now_ms + int(delay * 1000)
+
+        mode, dedupe_id, ttl_ms, extend, replace = self._normalize_deduplication(message)
+        if mode == "debounce" and deliver_at_ms <= now_ms:
+            raise ValueError("Debounce deduplication requires delayed delivery.")
+
+        if mode == "none":
+            dedupe_key = f"{self.namespace}:dedupe:unused"
+        else:
+            dedupe_key = self._dedupe_key(message.queue_name, message.actor_name, dedupe_id)
+
+        decision = self.sync_scripts.enqueue_or_deduplicate_sync(
+            message_key_prefix=self._message_key_prefix(),
+            stream_key=self._stream_key(message.queue_name),
+            delayed_key=self._delayed_key(message.queue_name),
+            dedupe_key=dedupe_key,
+            message_id=message.message_id,
+            encoded_message=self._encode_message(message),
+            now_ms=now_ms,
+            deliver_at_ms=deliver_at_ms,
+            mode=mode,
+            ttl_ms=ttl_ms,
+            extend=extend,
+            replace=replace,
+            message_ttl_ms=self.message_ttl_ms,
+        )
+        if decision.status == "error":
+            raise ValueError(f"Redis deduplication rejected message {message.message_id}: {decision.message_id}")
+        return message
+
     async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> Consumer:
         self.declare_queue(queue_name)
         await self._ensure_group(queue_name)
@@ -539,6 +577,7 @@ class RedisBroker(Broker):
 
     async def close(self) -> None:
         await self.client.aclose()
+        self.sync_client.close()
 
 
 def _decode_stream_id(stream_id) -> str:
