@@ -4,6 +4,7 @@ import asyncio
 import os
 import time
 import unittest
+from collections import defaultdict
 
 import fluxera
 
@@ -29,6 +30,42 @@ async def wait_for_async(predicate, *, timeout: float = 2.0, interval: float = 0
             return
         await asyncio.sleep(interval)
     raise AssertionError("Timed out waiting for condition.")
+
+
+class _FlakyConsumer(fluxera.Consumer):
+    def __init__(self, broker: "_FlakyStubBroker", queue_name: str, base: fluxera.Consumer) -> None:
+        self._broker = broker
+        self._queue_name = queue_name
+        self._base = base
+
+    async def receive(self, *, limit: int, timeout: float | None) -> list[fluxera.Delivery]:
+        if self._broker.receive_failures[self._queue_name] == 0:
+            self._broker.receive_failures[self._queue_name] += 1
+            raise self._broker.failure_factory()
+        return await self._base.receive(limit=limit, timeout=timeout)
+
+    async def ack(self, delivery: fluxera.Delivery) -> None:
+        await self._base.ack(delivery)
+
+    async def reject(self, delivery: fluxera.Delivery, *, requeue: bool = False) -> None:
+        await self._base.reject(delivery, requeue=requeue)
+
+    async def extend_lease(self, delivery: fluxera.Delivery, *, seconds: float) -> None:
+        await self._base.extend_lease(delivery, seconds=seconds)
+
+    async def close(self) -> None:
+        await self._base.close()
+
+
+class _FlakyStubBroker(fluxera.StubBroker):
+    def __init__(self, failure_factory) -> None:
+        super().__init__()
+        self.failure_factory = failure_factory
+        self.receive_failures: defaultdict[str, int] = defaultdict(int)
+
+    async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> fluxera.Consumer:
+        base = await super().open_consumer(queue_name, prefetch=prefetch)
+        return _FlakyConsumer(self, queue_name, base)
 
 
 class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -427,6 +464,49 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retry_exhausted_payloads[0]["event"], "retry_exhausted")
         self.assertEqual(retry_exhausted_payloads[0]["failure_kind"], "exception")
         self.assertEqual(dead_letter_ids, [retry_exhausted_payloads[0]["dead_letter_id"]])
+
+    async def test_consumer_transient_receive_errors_are_retried(self) -> None:
+        broker = _FlakyStubBroker(lambda: OSError("temporary socket issue"))
+        fluxera.set_broker(broker)
+        processed: list[int] = []
+
+        @fluxera.actor(queue_name="recover")
+        async def recover_task(value: int) -> None:
+            processed.append(value)
+
+        worker = fluxera.Worker(broker, concurrency=1, prefetch=1, poll_timeout=0.01)
+        await worker.start()
+        try:
+            await recover_task.send(7)
+            await asyncio.wait_for(broker.join(recover_task.queue_name), timeout=2.0)
+            await wait_for_async(lambda: processed == [7], timeout=2.0)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(broker.receive_failures[recover_task.queue_name], 1)
+        self.assertEqual(processed, [7])
+
+    async def test_consumer_task_crash_is_supervised_and_restarted(self) -> None:
+        broker = _FlakyStubBroker(lambda: RuntimeError("unexpected receive crash"))
+        fluxera.set_broker(broker)
+        processed: list[int] = []
+
+        @fluxera.actor(queue_name="restart")
+        async def restart_task(value: int) -> None:
+            processed.append(value)
+
+        worker = fluxera.Worker(broker, concurrency=1, prefetch=1, poll_timeout=0.01)
+        await worker.start()
+        try:
+            await wait_for_async(lambda: broker.receive_failures[restart_task.queue_name] == 1, timeout=2.0)
+            await restart_task.send(9)
+            await asyncio.wait_for(broker.join(restart_task.queue_name), timeout=2.0)
+            await wait_for_async(lambda: processed == [9], timeout=2.0)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(broker.receive_failures[restart_task.queue_name], 1)
+        self.assertEqual(processed, [9])
 
     async def test_revision_control_plane_bootstraps_and_promotes(self) -> None:
         broker = fluxera.StubBroker()

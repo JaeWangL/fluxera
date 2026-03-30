@@ -1,8 +1,8 @@
 # Fluxera Benchmark Notes
 
-Last updated: 2026-03-29
+Last updated: 2026-03-31
 
-This document records the latest local benchmark pass used before the `0.1.0` release candidate.
+This document records the latest local benchmark pass used before the `0.1.1` release candidate.
 
 Label legend:
 
@@ -30,7 +30,7 @@ python3 benchmarks/production_compare.py --profile smoke
 Redis transport comparison:
 
 ```bash
-python3 benchmarks/redis_transport_compare.py --repeat 3 --long-io-secs 1.5
+python3 benchmarks/redis_transport_compare.py --repeat 5 --long-io-secs 1.5
 ```
 
 Verification suite:
@@ -155,9 +155,9 @@ Scenario: `redis-fanout`
 
 | Runtime | Wall | Peak RSS | Peak threads | Msg/s |
 | --- | ---: | ---: | ---: | ---: |
-| Fluxera `c=256` | `0.311s` | `41.44 MiB` | `2` | `773.0` |
-| Dramatiq `t=8` | `0.379s` | `43.12 MiB` | `12` | `641.4` |
-| Dramatiq `t=32` | `0.352s` | `44.38 MiB` | `36` | `685.8` |
+| Fluxera `c=256` | `0.276s` | `41.51 MiB` | `2` | `868.3` |
+| Dramatiq `t=8` | `0.407s` | `41.77 MiB` | `12` | `590.4` |
+| Dramatiq `t=32` | `0.358s` | `44.47 MiB` | `36` | `671.8` |
 
 Takeaway:
 
@@ -169,13 +169,13 @@ Scenario: `redis-mixed-long-short`
 
 | Runtime | Wall | Short drain | Peak threads |
 | --- | ---: | ---: | ---: |
-| Fluxera `c=96` | `1.527s` | `0.081s` | `2` |
-| Dramatiq `t=8` | `3.176s` | `1.673s` | `12` |
-| Dramatiq `t=32` | `1.713s` | `0.089s` | `36` |
+| Fluxera `c=96` | `1.542s` | `0.089s` | `2` |
+| Dramatiq `t=8` | `3.125s` | `1.660s` | `12` |
+| Dramatiq `t=32` | `1.681s` | `0.094s` | `36` |
 
 Takeaway:
 
-- Fluxera was `2.08x` faster than Dramatiq `t=8`.
+- Fluxera was `2.03x` faster than Dramatiq `t=8`.
 - To match Fluxera's short-drain latency, Dramatiq again needed a much larger worker-thread count.
 
 ### 3. Redis stale reclaim
@@ -184,7 +184,7 @@ Scenario: `redis-stale-reclaim`
 
 | Runtime | Wall | Reclaim-only time | Messages reclaimed |
 | --- | ---: | ---: | ---: |
-| Fluxera | `1.398s` | `0.647s` | `2048` |
+| Fluxera | `1.382s` | `0.641s` | `2048` |
 
 Takeaway:
 

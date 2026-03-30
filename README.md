@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.1.0` is the current public alpha.
+`0.1.1` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -308,7 +308,7 @@ Headline results against the current local Dramatiq checkout:
 | production-shaped async fanout | `0.258s` | `0.385s (t=8)` / `0.319s (t=32)` | Fluxera is faster with `2` threads instead of `12` or `36` |
 | single-worker CPU-bound | `1.270s` | `3.893s (t=8)` / `3.704s (t=32)` | process lane still gives Fluxera a large single-worker win |
 | mixed long I/O + short work | `short_drain=0.040s` | `6.038s (t=8)` / `0.098s (t=32)` | long I/O does not starve short work |
-| Redis mixed long/short | `wall=1.527s`, `short_drain=0.081s` | `3.176s`, `1.673s (t=8)` / `1.713s`, `0.089s (t=32)` | transport advantage remains on real Redis |
+| Redis mixed long/short | `wall=1.542s`, `short_drain=0.089s` | `3.125s`, `1.660s (t=8)` / `1.681s`, `0.094s (t=32)` | transport advantage remains on real Redis |
 
 See [BENCHMARK.md](docs/BENCHMARK.md) for the full methodology and numbers.
 
@@ -320,7 +320,7 @@ The current release candidate was checked with:
 
 - `python3 -m unittest discover -s tests -v`
 - `python3 benchmarks/production_compare.py --profile smoke`
-- `python3 benchmarks/redis_transport_compare.py --repeat 3 --long-io-secs 1.5`
+- `python3 benchmarks/redis_transport_compare.py --repeat 5 --long-io-secs 1.5`
 - `/tmp/fluxera-release-venv/bin/python -m build --sdist --wheel`
 - `/tmp/fluxera-release-venv/bin/python -m twine check dist/*`
 

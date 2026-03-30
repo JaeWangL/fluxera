@@ -12,8 +12,11 @@ import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 from uuid import uuid4
+
+import redis.exceptions as redis_exceptions
 
 from ..broker import Broker, Consumer, Delivery
 from ..callbacks import DeadLetterContext, OutcomeContext
@@ -334,6 +337,7 @@ class Worker:
         self.record_history: dict[str, list[TaskRecord]] = defaultdict(list)
 
         self.ingress_tasks: set[asyncio.Task[None]] = set()
+        self.consumer_restart_tasks: dict[str, asyncio.Task[None]] = {}
         self.execution_tasks: set[asyncio.Task[None]] = set()
         self.scheduler_tasks: dict[str, asyncio.Task[None]] = {}
         self.revision_task: Optional[asyncio.Task[None]] = None
@@ -433,9 +437,7 @@ class Worker:
         for queue_name in sorted(queue_names):
             consumer = await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
             self.consumers[queue_name] = consumer
-            task = asyncio.create_task(self._consume(queue_name, consumer), name=f"fluxera-consumer:{queue_name}")
-            self.ingress_tasks.add(task)
-            task.add_done_callback(self.ingress_tasks.discard)
+            self._start_consumer_task(queue_name, consumer)
 
         for execution in sorted(self.ready_queues):
             task = asyncio.create_task(self._schedule_lane(execution), name=f"fluxera-scheduler:{execution}")
@@ -450,11 +452,137 @@ class Worker:
                 return
             await asyncio.sleep(self.poll_timeout)
 
+    def _start_consumer_task(self, queue_name: str, consumer: Consumer) -> None:
+        task = asyncio.create_task(
+            self._consume(queue_name, consumer),
+            name=f"fluxera-consumer:{queue_name}",
+        )
+        self.ingress_tasks.add(task)
+        task.add_done_callback(partial(self._on_consumer_task_done, queue_name))
+
+    def _on_consumer_task_done(self, queue_name: str, task: asyncio.Task[None]) -> None:
+        self.ingress_tasks.discard(task)
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except BaseException:  # pragma: no cover - defensive logging path
+            logger.exception("Failed to inspect consumer task completion for queue %r.", queue_name)
+            if not self._stopping:
+                self._schedule_consumer_restart(queue_name)
+            return
+
+        if exc is None:
+            if not self._stopping:
+                logger.warning(
+                    "Consumer task for queue %r exited unexpectedly without an exception. Restarting.",
+                    queue_name,
+                )
+                self._schedule_consumer_restart(queue_name)
+            return
+
+        logger.warning(
+            "Consumer task for queue %r crashed; scheduling restart.",
+            queue_name,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        if not self._stopping:
+            self._schedule_consumer_restart(queue_name)
+
+    def _schedule_consumer_restart(self, queue_name: str) -> None:
+        existing = self.consumer_restart_tasks.get(queue_name)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(
+            self._restart_consumer(queue_name),
+            name=f"fluxera-consumer-restart:{queue_name}",
+        )
+        self.consumer_restart_tasks[queue_name] = task
+        task.add_done_callback(partial(self._on_consumer_restart_done, queue_name))
+
+    def _on_consumer_restart_done(self, queue_name: str, task: asyncio.Task[None]) -> None:
+        current = self.consumer_restart_tasks.get(queue_name)
+        if current is task:
+            self.consumer_restart_tasks.pop(queue_name, None)
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except BaseException:  # pragma: no cover - defensive logging path
+            logger.exception("Failed to inspect consumer restart task for queue %r.", queue_name)
+            if not self._stopping:
+                self._schedule_consumer_restart(queue_name)
+            return
+
+        if exc is not None:
+            logger.warning(
+                "Consumer restart task for queue %r failed; scheduling another retry.",
+                queue_name,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            if not self._stopping:
+                self._schedule_consumer_restart(queue_name)
+
+    async def _restart_consumer(self, queue_name: str) -> None:
+        delay = self.poll_timeout
+        while not self._stopping and queue_name in self.managed_queues:
+            old_consumer = self.consumers.get(queue_name)
+            if old_consumer is not None:
+                try:
+                    await old_consumer.close()
+                except BaseException:  # pragma: no cover - close failures are non-fatal
+                    logger.warning(
+                        "Failed to close previous consumer for queue %r during restart.",
+                        queue_name,
+                        exc_info=True,
+                    )
+
+            try:
+                consumer = await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
+            except BaseException:
+                logger.warning(
+                    "Failed to reopen consumer for queue %r; retrying in %.3fs.",
+                    queue_name,
+                    delay,
+                    exc_info=True,
+                )
+                await asyncio.sleep(delay)
+                delay = min(max(delay * 2.0, self.poll_timeout), 5.0)
+                continue
+
+            self.consumers[queue_name] = consumer
+            self._start_consumer_task(queue_name, consumer)
+            logger.info("Restarted consumer for queue %r.", queue_name)
+            return
+
+    async def _reopen_consumer(self, queue_name: str, consumer: Consumer) -> Consumer:
+        try:
+            await consumer.close()
+        except BaseException:  # pragma: no cover - close failures are non-fatal
+            logger.warning(
+                "Failed to close consumer for queue %r before reopening.",
+                queue_name,
+                exc_info=True,
+            )
+
+        new_consumer = await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
+        self.consumers[queue_name] = new_consumer
+        return new_consumer
+
     async def stop(self, *, timeout: float = 30.0) -> None:
         if not self._running:
             return
 
         self._stopping = True
+
+        for task in list(self.consumer_restart_tasks.values()):
+            task.cancel()
+        if self.consumer_restart_tasks:
+            await asyncio.gather(*self.consumer_restart_tasks.values(), return_exceptions=True)
+            self.consumer_restart_tasks.clear()
 
         for task in list(self.ingress_tasks):
             task.cancel()
@@ -548,7 +676,33 @@ class Worker:
                 await asyncio.sleep(self.poll_timeout)
                 continue
 
-            deliveries = await consumer.receive(limit=batch_size, timeout=self.poll_timeout)
+            try:
+                deliveries = await consumer.receive(limit=batch_size, timeout=self.poll_timeout)
+            except (
+                redis_exceptions.TimeoutError,
+                redis_exceptions.ConnectionError,
+                ConnectionError,
+                OSError,
+            ) as exc:
+                if self._stopping:
+                    break
+
+                logger.warning(
+                    "Transient consumer error on queue %r; retrying.",
+                    queue_name,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                try:
+                    consumer = await self._reopen_consumer(queue_name, consumer)
+                except BaseException:
+                    logger.warning(
+                        "Failed to reopen consumer for queue %r after transient error.",
+                        queue_name,
+                        exc_info=True,
+                    )
+                await asyncio.sleep(self.poll_timeout)
+                continue
+
             for delivery in deliveries:
                 try:
                     actor = self.broker.get_actor(delivery.actor_name)

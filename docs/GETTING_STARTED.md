@@ -371,7 +371,7 @@ These cover:
 
 ## Current Limits
 
-`0.1.0` is an early alpha, so a few edges are still intentionally narrow:
+`0.1.1` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet
