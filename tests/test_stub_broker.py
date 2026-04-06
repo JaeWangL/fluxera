@@ -68,6 +68,37 @@ class _FlakyStubBroker(fluxera.StubBroker):
         return _FlakyConsumer(self, queue_name, base)
 
 
+class _RedeliverOnceConsumer(fluxera.Consumer):
+    def __init__(self, base: fluxera.Consumer) -> None:
+        self._base = base
+        self._tagged = False
+
+    async def receive(self, *, limit: int, timeout: float | None) -> list[fluxera.Delivery]:
+        deliveries = await self._base.receive(limit=limit, timeout=timeout)
+        if deliveries and not self._tagged:
+            deliveries[0].redelivered = True
+            self._tagged = True
+        return deliveries
+
+    async def ack(self, delivery: fluxera.Delivery) -> None:
+        await self._base.ack(delivery)
+
+    async def reject(self, delivery: fluxera.Delivery, *, requeue: bool = False) -> None:
+        await self._base.reject(delivery, requeue=requeue)
+
+    async def extend_lease(self, delivery: fluxera.Delivery, *, seconds: float) -> None:
+        await self._base.extend_lease(delivery, seconds=seconds)
+
+    async def close(self) -> None:
+        await self._base.close()
+
+
+class _RedeliverOnceStubBroker(fluxera.StubBroker):
+    async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> fluxera.Consumer:
+        base = await super().open_consumer(queue_name, prefetch=prefetch)
+        return _RedeliverOnceConsumer(base)
+
+
 class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_worker_processes_many_messages_concurrently(self) -> None:
         broker = fluxera.StubBroker()
@@ -344,6 +375,162 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 1)
         self.assertEqual(len(broker.dead_letters), 1)
         self.assertEqual(broker.dead_letters[0].exception_type, "ValueError")
+
+    async def test_rate_limit_exceeded_defers_without_consuming_retry_budget(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        attempts = 0
+        completions = 0
+
+        @fluxera.actor(max_retries=0, rate_limit_defer_ms=5)
+        async def eventually_runs() -> None:
+            nonlocal attempts, completions
+            attempts += 1
+            if attempts < 3:
+                raise fluxera.RateLimitExceeded("busy")
+            completions += 1
+
+        worker = fluxera.Worker(broker, concurrency=1, poll_timeout=0.01)
+        await worker.start()
+        try:
+            message = await eventually_runs.send()
+            await broker.join(eventually_runs.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(attempts, 3)
+        self.assertEqual(completions, 1)
+        self.assertEqual(broker.dead_letters, [])
+        history = worker.record_history[message.message_id]
+        self.assertEqual(len(history), 3)
+        self.assertTrue(all(record.attempt == 0 for record in history))
+        self.assertEqual(history[0].final_action, "defer")
+        self.assertEqual(history[1].final_action, "defer")
+        self.assertEqual(history[2].final_action, "ack")
+
+    async def test_on_redelivered_callback_runs_for_recovered_delivery(self) -> None:
+        broker = _RedeliverOnceStubBroker()
+        fluxera.set_broker(broker)
+        events: list[fluxera.OutcomeContext] = []
+
+        def on_redelivered(context: fluxera.OutcomeContext) -> None:
+            events.append(context)
+
+        @fluxera.actor(on_redelivered=on_redelivered)
+        async def recovered() -> None:
+            return None
+
+        worker = fluxera.Worker(broker, concurrency=1)
+        await worker.start()
+        try:
+            await recovered.send()
+            await broker.join(recovered.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event, "redelivered")
+        self.assertTrue(events[0].redelivered)
+        self.assertEqual(events[0].actor_name, recovered.actor_name)
+
+    async def test_on_worker_lost_callback_runs_for_recovered_delivery(self) -> None:
+        broker = _RedeliverOnceStubBroker()
+        fluxera.set_broker(broker)
+        events: list[fluxera.OutcomeContext] = []
+
+        def on_worker_lost(context: fluxera.OutcomeContext) -> None:
+            events.append(context)
+
+        @fluxera.actor(on_worker_lost=on_worker_lost)
+        async def recovered() -> None:
+            return None
+
+        worker = fluxera.Worker(broker, concurrency=1)
+        await worker.start()
+        try:
+            await recovered.send()
+            await broker.join(recovered.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event, "worker_lost")
+        self.assertTrue(events[0].redelivered)
+        self.assertEqual(events[0].actor_name, recovered.actor_name)
+
+    async def test_worker_default_on_worker_lost_callback_runs_for_recovered_delivery(self) -> None:
+        broker = _RedeliverOnceStubBroker()
+        fluxera.set_broker(broker)
+        events: list[fluxera.OutcomeContext] = []
+
+        def on_worker_lost(context: fluxera.OutcomeContext) -> None:
+            events.append(context)
+
+        @fluxera.actor
+        async def recovered() -> None:
+            return None
+
+        worker = fluxera.Worker(broker, concurrency=1, on_worker_lost=on_worker_lost)
+        await worker.start()
+        try:
+            await recovered.send()
+            await broker.join(recovered.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event, "worker_lost")
+        self.assertTrue(events[0].redelivered)
+        self.assertEqual(events[0].actor_name, recovered.actor_name)
+
+    async def test_redelivery_policy_fail_dead_letters_without_running_actor(self) -> None:
+        broker = _RedeliverOnceStubBroker()
+        fluxera.set_broker(broker)
+        runs = 0
+        failure_kinds: list[str | None] = []
+
+        async def on_failure(context: fluxera.OutcomeContext) -> None:
+            failure_kinds.append(context.failure_kind)
+
+        @fluxera.actor(redelivery_policy="fail", on_failure=on_failure)
+        async def recovered() -> None:
+            nonlocal runs
+            runs += 1
+
+        worker = fluxera.Worker(broker, concurrency=1)
+        await worker.start()
+        try:
+            await recovered.send()
+            await broker.join(recovered.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(runs, 0)
+        self.assertEqual(failure_kinds, ["worker_lost"])
+        self.assertEqual(len(broker.dead_letters), 1)
+        self.assertEqual(broker.dead_letters[0].failure_kind, "worker_lost")
+
+    async def test_worker_default_redelivery_policy_fail_dead_letters_without_running_actor(self) -> None:
+        broker = _RedeliverOnceStubBroker()
+        fluxera.set_broker(broker)
+        runs = 0
+
+        @fluxera.actor
+        async def recovered() -> None:
+            nonlocal runs
+            runs += 1
+
+        worker = fluxera.Worker(broker, concurrency=1, default_redelivery_policy="fail")
+        await worker.start()
+        try:
+            await recovered.send()
+            await broker.join(recovered.queue_name)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(runs, 0)
+        self.assertEqual(len(broker.dead_letters), 1)
+        self.assertEqual(broker.dead_letters[0].failure_kind, "worker_lost")
 
     async def test_retry_when_controls_retry_schedule(self) -> None:
         broker = fluxera.StubBroker()

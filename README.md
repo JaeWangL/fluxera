@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.1.1` is the current public alpha.
+`0.1.5` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -164,6 +164,66 @@ That is intentional: startup only proves a worker booted, not that the new
 revision should already receive queue traffic. Simple deployments may still
 choose to auto-promote in their entrypoint or release automation.
 
+## Runtime Monitoring And Admin Dashboard
+
+Fluxera includes runtime monitoring commands and a lightweight `/admin` dashboard.
+
+Get a JSON snapshot of worker and queue state:
+
+```bash
+fluxera monitor snapshot \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --namespace hello-fluxera \
+  --format json
+```
+
+Run a local admin dashboard:
+
+```bash
+fluxera monitor serve \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --namespace hello-fluxera \
+  --host 0.0.0.0 \
+  --port 8090
+```
+
+Dashboard endpoints:
+
+- `/admin`: auto-refreshing queue/worker dashboard
+- `/admin/snapshot`: full runtime JSON payload
+- `/healthz`: health check for probes and deployment gates
+
+The runtime snapshot includes:
+
+- online/stale workers, revision, queue acceptance state
+- queue backlog (`stream_ready`, `delayed`) and pending deliveries
+- `pending_stale` count (idle deliveries likely stuck)
+- `waiting_not_running` count for requests received but not yet executing
+
+If you already run a root ASGI server (FastAPI/Starlette), mount Fluxera admin
+into the existing router instead of using a separate port:
+
+```python
+from fastapi import FastAPI
+
+import fluxera
+
+
+app = FastAPI()
+fluxera.mount_admin_asgi(
+    app,
+    mount_path="/admin/fluxera",
+    redis_url="redis://127.0.0.1:6379/15",
+    namespace="hello-fluxera",
+)
+```
+
+Mounted endpoints become:
+
+- `/admin/fluxera/`
+- `/admin/fluxera/snapshot`
+- `/admin/fluxera/healthz`
+
 ## Delivery Semantics
 
 - Transport delivery is at-least-once.
@@ -243,7 +303,28 @@ Rules of thumb:
 - `retry_when` overrides the simpler retry count rule
 - `on_success` and `on_failure` can be sync or async callables
 - `on_retry_exhausted` and `on_dead_lettered` can be callables or actor names
+- `on_worker_lost` runs when a stale in-flight delivery is recovered (redelivered)
+- `redelivery_policy="fail"` rejects recovered deliveries immediately instead of re-running actor code
+- `Worker(on_worker_lost=..., default_redelivery_policy=...)` sets global defaults across actors
 - actor callbacks receive JSON-safe payloads, not raw exception objects
+
+Worker-global defaults example:
+
+```python
+import fluxera
+
+
+async def mark_failed(context: fluxera.OutcomeContext) -> None:
+    print("worker_lost", context.actor_name, context.message.message_id)
+
+
+worker = fluxera.Worker(
+    broker,
+    concurrency=128,
+    on_worker_lost=mark_failed,
+    default_redelivery_policy="fail",
+)
+```
 
 ## Distributed Concurrency Limits
 

@@ -8,7 +8,7 @@ from .encoder import encode_message_snapshot
 from .message import Message
 
 
-OutcomeEvent = Literal["success", "failure", "retry_scheduled", "retry_exhausted"]
+OutcomeEvent = Literal["success", "failure", "retry_scheduled", "retry_exhausted", "redelivered", "worker_lost"]
 
 
 @dataclass(slots=True)
@@ -20,6 +20,7 @@ class OutcomeContext:
     attempt: int
     max_retries: int
     execution_mode: str
+    redelivered: bool = False
     worker_id: Optional[str] = None
     worker_revision: Optional[str] = None
     result: Any = None
@@ -40,6 +41,7 @@ class OutcomeContext:
             "attempt": self.attempt,
             "max_retries": self.max_retries,
             "execution_mode": self.execution_mode,
+            "redelivered": self.redelivered,
             "worker_id": self.worker_id,
             "worker_revision": self.worker_revision,
             "failure_kind": self.failure_kind,

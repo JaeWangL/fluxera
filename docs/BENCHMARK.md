@@ -2,7 +2,7 @@
 
 Last updated: 2026-03-31
 
-This document records the latest local benchmark pass used before the `0.1.1` release candidate.
+This document records the latest local benchmark pass used before the `0.1.2` release candidate.
 
 Label legend:
 

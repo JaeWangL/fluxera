@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 import orjson
@@ -325,6 +325,7 @@ class RedisBroker(Broker):
         worker_id: str,
         worker_revision: str,
         queue_states: dict[str, str],
+        runtime_state: Optional[dict[str, Any]] = None,
     ) -> None:
         now_ms = int(time.time() * 1000)
         worker_key = self._worker_key(worker_id)
@@ -338,6 +339,11 @@ class RedisBroker(Broker):
             "queues": all_queues,
             "accepting_queues": accepting,
         }
+        if runtime_state:
+            for key, value in runtime_state.items():
+                if value is None:
+                    continue
+                mapping[str(key)] = str(value)
         pipe = self.client.pipeline()
         pipe.hset(worker_key, mapping=mapping)
         pipe.pexpire(worker_key, self.worker_presence_ttl_ms)
@@ -354,6 +360,140 @@ class RedisBroker(Broker):
         for queue_name in queue_names:
             pipe.zrem(self._workers_key(queue_name), worker_id)
         await pipe.execute()
+
+    async def list_runtime_queues(self) -> list[str]:
+        queue_names = set(self.queues)
+        scans = (
+            (f"{self.namespace}:serving_revision:*", f"{self.namespace}:serving_revision:"),
+            (f"{self.namespace}:stream:*", f"{self.namespace}:stream:"),
+            (f"{self.namespace}:delayed:*", f"{self.namespace}:delayed:"),
+            (f"{self.namespace}:workers:*", f"{self.namespace}:workers:"),
+            (f"{self.namespace}:dlq:*", f"{self.namespace}:dlq:"),
+        )
+        for pattern, prefix in scans:
+            async for raw_key in self.client.scan_iter(match=pattern, count=128):
+                key = _decode_message_id(raw_key)
+                if key.startswith(prefix):
+                    queue_name = key[len(prefix) :]
+                    if prefix.endswith(":dlq:") and queue_name.startswith("record:"):
+                        continue
+                    if queue_name:
+                        queue_names.add(queue_name)
+        return sorted(queue_names)
+
+    async def list_worker_runtime_rows(self, *, queue_names: Optional[set[str]] = None) -> list[dict[str, str]]:
+        worker_ids: set[str] = set()
+        if queue_names:
+            for queue_name in queue_names:
+                members = await self.client.zrange(self._workers_key(queue_name), 0, -1)
+                for raw_member in members:
+                    worker_ids.add(_decode_message_id(raw_member))
+        else:
+            prefix = f"{self.namespace}:worker:"
+            async for raw_key in self.client.scan_iter(match=f"{prefix}*", count=128):
+                key = _decode_message_id(raw_key)
+                if key.startswith(prefix):
+                    worker_ids.add(key[len(prefix) :])
+
+        if not worker_ids:
+            return []
+
+        worker_ids_sorted = sorted(worker_id for worker_id in worker_ids if worker_id)
+        pipe = self.client.pipeline()
+        for worker_id in worker_ids_sorted:
+            pipe.hgetall(self._worker_key(worker_id))
+        payloads = await pipe.execute()
+
+        rows: list[dict[str, str]] = []
+        for worker_id, payload in zip(worker_ids_sorted, payloads):
+            if not payload:
+                continue
+            decoded = {
+                _decode_message_id(key): _decode_message_id(value)
+                for key, value in payload.items()
+            }
+            decoded["worker_id"] = worker_id
+            rows.append(decoded)
+        return rows
+
+    async def get_queue_runtime_row(
+        self,
+        queue_name: str,
+        *,
+        pending_idle_threshold_ms: Optional[int] = None,
+    ) -> dict[str, Any]:
+        stream_key = self._stream_key(queue_name)
+        delayed_key = self._delayed_key(queue_name)
+        workers_key = self._workers_key(queue_name)
+
+        pipe = self.client.pipeline()
+        pipe.exists(stream_key)
+        pipe.zcard(delayed_key)
+        pipe.zrange(workers_key, 0, -1)
+        exists_stream, delayed_count, worker_members = await pipe.execute()
+
+        stream_length = 0
+        if int(exists_stream):
+            stream_length = int(await self.client.xlen(stream_key))
+
+        pending_count = 0
+        try:
+            pending = await self.client.xpending(stream_key, self.group_name)
+        except ResponseError as exc:
+            message = _normalize_error_message(exc)
+            if "NOGROUP" not in message and "no such key" not in message:
+                raise
+        else:
+            pending_count = int(pending["pending"])
+
+        pending_stale_count = 0
+        if pending_idle_threshold_ms is not None and pending_idle_threshold_ms > 0 and pending_count > 0:
+            pending_stale_count = await self._count_pending_with_min_idle(
+                stream_key,
+                min_idle_ms=pending_idle_threshold_ms,
+            )
+
+        return {
+            "queue_name": queue_name,
+            "serving_revision": await self.get_serving_revision(queue_name),
+            "stream_length": stream_length,
+            "delayed_count": int(delayed_count),
+            "pending_count": pending_count,
+            "pending_stale_count": pending_stale_count,
+            "worker_ids": [_decode_message_id(worker_id) for worker_id in worker_members],
+        }
+
+    async def _count_pending_with_min_idle(self, stream_key: str, *, min_idle_ms: int) -> int:
+        total = 0
+        start = "-"
+        previous_last_id = None
+        while True:
+            try:
+                entries = await self.client.xpending_range(
+                    stream_key,
+                    self.group_name,
+                    start,
+                    "+",
+                    self.pending_scan_size,
+                    idle=min_idle_ms,
+                )
+            except ResponseError as exc:
+                message = _normalize_error_message(exc)
+                if "NOGROUP" in message or "no such key" in message:
+                    return total
+                raise
+            if not entries:
+                return total
+
+            total += len(entries)
+            last_id = _pending_entry_message_id(entries[-1])
+            if not last_id or last_id == previous_last_id:
+                return total
+            previous_last_id = last_id
+
+            if len(entries) < self.pending_scan_size:
+                return total
+            start = f"({last_id}"
 
     async def _promote_due(self, queue_name: str, *, limit: Optional[int] = None) -> int:
         return await self.scripts.promote_due(
@@ -590,6 +730,17 @@ def _decode_message_id(raw) -> str:
     if isinstance(raw, bytes):
         return raw.decode("utf-8")
     return str(raw)
+
+
+def _pending_entry_message_id(entry: Any) -> str:
+    if isinstance(entry, dict):
+        if "message_id" in entry:
+            return _decode_message_id(entry["message_id"])
+        if b"message_id" in entry:
+            return _decode_message_id(entry[b"message_id"])
+    if isinstance(entry, (list, tuple)) and entry:
+        return _decode_message_id(entry[0])
+    return ""
 
 
 class _RedisConsumer(Consumer):

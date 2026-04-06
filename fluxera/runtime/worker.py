@@ -21,7 +21,7 @@ import redis.exceptions as redis_exceptions
 from ..broker import Broker, Consumer, Delivery
 from ..callbacks import DeadLetterContext, OutcomeContext
 from ..dead_letters import DeadLetterRecord, FailureKind
-from ..errors import ActorNotFound, RemoteExecutionError, WorkerError
+from ..errors import ActorNotFound, RateLimitExceeded, RemoteExecutionError, WorkerError
 from ..message import current_millis
 
 if TYPE_CHECKING:
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 DEFAULT_PROCESS_START_METHOD = "spawn"
 DEFAULT_RETRY_JITTER = "full"
+DEFAULT_RATE_LIMIT_DEFER_MS = 1_000
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,8 @@ class Worker:
         worker_revision: Optional[str] = None,
         worker_id: Optional[str] = None,
         revision_poll_interval: float = 1.0,
+        on_worker_lost: Any = None,
+        default_redelivery_policy: str = "continue",
     ) -> None:
         self.broker = broker
         self.queue_filter = queues
@@ -319,6 +322,13 @@ class Worker:
         self.worker_revision = worker_revision or os.environ.get("FLUXERA_WORKER_REVISION") or "local"
         self.worker_id = worker_id or f"fluxera-worker-{uuid4().hex}"
         self.revision_poll_interval = max(float(revision_poll_interval), 0.05)
+        self.default_outcome_callback_targets: dict[str, list[Any]] = {
+            "on_worker_lost": self._normalize_callback_targets(on_worker_lost),
+        }
+        self.default_redelivery_policy = self._coerce_redelivery_policy(
+            default_redelivery_policy,
+            option_name="default_redelivery_policy",
+        )
 
         self.ready_queues: dict[str, asyncio.Queue[_ScheduledDelivery]] = {
             execution: asyncio.Queue(maxsize=self._queue_size_for_lane(execution))
@@ -347,6 +357,13 @@ class Worker:
         self.process_lane_lock = asyncio.Lock()
         self.managed_queues: set[str] = set()
         self.queue_states: dict[str, str] = {}
+        self.started_at_ms = current_millis()
+
+        self.metrics_completed_total = 0
+        self.metrics_succeeded_total = 0
+        self.metrics_failed_total = 0
+        self.metrics_retried_total = 0
+        self.metrics_dead_lettered_total = 0
 
         self._running = False
         self._stopping = False
@@ -387,6 +404,35 @@ class Worker:
     def _accepts_queue(self, queue_name: str) -> bool:
         return self.queue_states.get(queue_name, "accepting") == "accepting"
 
+    def _runtime_state_payload(self) -> dict[str, Any]:
+        return {
+            "worker_status": "stopping" if self._stopping else "running",
+            "started_at_ms": self.started_at_ms,
+            "in_flight": self.in_flight,
+            "ready_backlog": self._total_ready_backlog(),
+            "ready_capacity": self._total_ready_capacity(),
+            "ingress_tasks": len(self.ingress_tasks),
+            "consumer_restart_tasks": len(self.consumer_restart_tasks),
+            "execution_tasks": len(self.execution_tasks),
+            "completed_total": self.metrics_completed_total,
+            "succeeded_total": self.metrics_succeeded_total,
+            "failed_total": self.metrics_failed_total,
+            "retried_total": self.metrics_retried_total,
+            "dead_lettered_total": self.metrics_dead_lettered_total,
+        }
+
+    def _record_execution_metric(self, record: TaskRecord) -> None:
+        self.metrics_completed_total += 1
+        if record.final_action == "retry":
+            self.metrics_retried_total += 1
+        if record.final_action == "reject":
+            self.metrics_dead_lettered_total += 1
+
+        if record.state == "succeeded":
+            self.metrics_succeeded_total += 1
+        else:
+            self.metrics_failed_total += 1
+
     async def _refresh_revision_state(self, *, bootstrap: bool) -> None:
         if not self.managed_queues:
             return
@@ -406,6 +452,7 @@ class Worker:
             worker_id=self.worker_id,
             worker_revision=self.worker_revision,
             queue_states=next_states.copy(),
+            runtime_state=self._runtime_state_payload(),
         )
 
     async def _run_revision_heartbeat(self) -> None:
@@ -807,6 +854,23 @@ class Worker:
             record.started_at = time.perf_counter()
             record.started_at_ms = current_millis()
 
+            if item.delivery.redelivered:
+                await self._emit_outcome_callbacks(
+                    item,
+                    record,
+                    event="worker_lost",
+                    option_name="on_worker_lost",
+                )
+                await self._emit_outcome_callbacks(
+                    item,
+                    record,
+                    event="redelivered",
+                    option_name="on_redelivered",
+                )
+                if self._resolve_redelivery_policy(item.actor, item.delivery) == "fail":
+                    await self._fail_redelivered_delivery(item, record)
+                    return
+
             if record.timeout_ms is None:
                 record.result = await item.actor.run(*item.delivery.args, worker=self, **item.delivery.kwargs)
             else:
@@ -846,6 +910,7 @@ class Worker:
                 await asyncio.gather(lease_task, return_exceptions=True)
             record.finished_at = time.perf_counter()
             record.finished_at_ms = current_millis()
+            self._record_execution_metric(record)
             if lane_permit is not None:
                 lane_permit.release()
             if actor_permit is not None:
@@ -1035,13 +1100,36 @@ class Worker:
                 return normalized
         raise ValueError("jitter must be one of: True, False, 'full', 'none'.")
 
-    def _callback_targets(self, actor, delivery: Delivery, option_name: str) -> list[Any]:
-        target = delivery.options.get(option_name, actor.options.get(option_name))
+    def _coerce_redelivery_policy(self, raw_value: Any, *, option_name: str) -> str:
+        if not isinstance(raw_value, str):
+            raise ValueError(f"{option_name} must be a string, got {raw_value!r}.")
+
+        policy = raw_value.strip().lower()
+        if policy in {"continue", "fail"}:
+            return policy
+        raise ValueError(f"{option_name} must be one of: 'continue', 'fail'.")
+
+    def _normalize_callback_targets(self, target: Any) -> list[Any]:
         if target is None:
             return []
         if isinstance(target, (list, tuple, set)):
             return [item for item in target if item is not None]
         return [target]
+
+    def _callback_targets(self, actor, delivery: Delivery, option_name: str) -> list[Any]:
+        target = delivery.options.get(option_name, actor.options.get(option_name))
+        local_targets = self._normalize_callback_targets(target)
+        default_targets = self.default_outcome_callback_targets.get(option_name, [])
+        if not default_targets:
+            return local_targets
+        if not local_targets:
+            return list(default_targets)
+
+        combined = list(local_targets)
+        for item in default_targets:
+            if item not in combined:
+                combined.append(item)
+        return combined
 
     def _build_outcome_context(
         self,
@@ -1066,6 +1154,7 @@ class Worker:
             attempt=record.attempt,
             max_retries=record.max_retries,
             execution_mode=record.execution_mode,
+            redelivered=item.delivery.redelivered,
             worker_id=self.worker_id,
             worker_revision=self.worker_revision,
             result=result,
@@ -1162,7 +1251,12 @@ class Worker:
     ) -> None:
         try:
             retry_policy = self._resolve_retry_policy(actor, item.delivery)
-            should_retry = self._should_retry(record, retry_policy, exc, failure_kind=failure_kind)
+            rate_limit_defer_ms = None
+            if isinstance(exc, RateLimitExceeded):
+                rate_limit_defer_ms = self._resolve_rate_limit_defer_ms(actor, item.delivery)
+                should_retry = False
+            else:
+                should_retry = self._should_retry(record, retry_policy, exc, failure_kind=failure_kind)
         except Exception as policy_exc:
             record.final_action = "reject"
             self._attach_dead_letter_record(
@@ -1184,6 +1278,16 @@ class Worker:
                 dead_letter_id=None if dead_letter_record is None else dead_letter_record.dead_letter_id,
             )
             await self._emit_dead_letter_related_callbacks(item, record, dead_letter_record)
+            return
+
+        if isinstance(exc, RateLimitExceeded):
+            await self._defer_rate_limited_message(
+                item,
+                record,
+                exc=exc,
+                failure_kind=failure_kind,
+                defer_ms=0 if rate_limit_defer_ms is None else rate_limit_defer_ms,
+            )
             return
 
         if should_retry:
@@ -1324,6 +1428,100 @@ class Worker:
         if delay_ms > retry_policy.max_backoff_ms:
             return int(retry_policy.max_backoff_ms * random.uniform(0.5, 1.0))
         return delay_ms
+
+    def _resolve_rate_limit_defer_ms(self, actor, delivery: Delivery) -> int:
+        raw_defer = delivery.options.get("rate_limit_defer_ms", actor.options.get("rate_limit_defer_ms"))
+        if raw_defer is None:
+            raw_defer = os.getenv("FLUXERA_RATE_LIMIT_DEFER_MS")
+        if raw_defer is None:
+            return DEFAULT_RATE_LIMIT_DEFER_MS
+
+        try:
+            defer_ms = int(raw_defer)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"rate_limit_defer_ms must be an integer number of milliseconds, got {raw_defer!r}."
+            ) from exc
+
+        if defer_ms < 0:
+            raise ValueError(f"rate_limit_defer_ms must be greater than or equal to zero, got {defer_ms!r}.")
+        return defer_ms
+
+    def _resolve_redelivery_policy(self, actor, delivery: Delivery) -> str:
+        raw_policy = delivery.options.get(
+            "redelivery_policy",
+            actor.options.get("redelivery_policy", self.default_redelivery_policy),
+        )
+        return self._coerce_redelivery_policy(raw_policy, option_name="redelivery_policy")
+
+    async def _fail_redelivered_delivery(self, item: _ScheduledDelivery, record: TaskRecord) -> None:
+        exc = WorkerError("Recovered redelivery was configured with redelivery_policy='fail'.")
+        record.state = "failed"
+        record.exception = exc
+        if record.failed_at_ms is None:
+            record.failed_at_ms = current_millis()
+        record.final_action = "reject"
+        self._attach_dead_letter_record(item, item.actor, record, exc=exc, failure_kind="worker_lost")
+        await item.consumer.reject(item.delivery, requeue=False)
+        dead_letter_record = item.delivery.metadata.get("dead_letter_record")
+        dead_letter_id = None if dead_letter_record is None else dead_letter_record.dead_letter_id
+        await self._emit_outcome_callbacks(
+            item,
+            record,
+            event="failure",
+            option_name="on_failure",
+            failure_kind="worker_lost",
+            exc=exc,
+            dead_letter_id=dead_letter_id,
+        )
+        await self._emit_outcome_callbacks(
+            item,
+            record,
+            event="retry_exhausted",
+            option_name="on_retry_exhausted",
+            failure_kind="worker_lost",
+            exc=exc,
+            dead_letter_id=dead_letter_id,
+        )
+        await self._emit_dead_letter_related_callbacks(item, record, dead_letter_record)
+
+    async def _defer_rate_limited_message(
+        self,
+        item,
+        record: TaskRecord,
+        *,
+        exc: BaseException,
+        failure_kind: FailureKind,
+        defer_ms: int,
+    ) -> None:
+        await self.broker.send(
+            item.delivery.message.copy(
+                options={
+                    "rate_limit_requeue_timestamp": current_millis(),
+                }
+            ),
+            delay=defer_ms / 1000 if defer_ms > 0 else None,
+        )
+        record.state = "retry_scheduled"
+        record.retry_delay_ms = defer_ms
+        record.final_action = "defer"
+        await item.consumer.ack(item.delivery)
+        await self._emit_outcome_callbacks(
+            item,
+            record,
+            event="failure",
+            option_name="on_failure",
+            failure_kind=failure_kind,
+            exc=exc,
+        )
+        await self._emit_outcome_callbacks(
+            item,
+            record,
+            event="retry_scheduled",
+            option_name="on_retry_scheduled",
+            failure_kind=failure_kind,
+            exc=exc,
+        )
 
     def _attach_terminal_dead_letter(
         self,

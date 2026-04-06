@@ -12,6 +12,7 @@ ResolutionState = Literal["active", "requeued", "purged"]
 FailureKind = Literal[
     "exception",
     "timeout",
+    "worker_lost",
     "cancel_reject",
     "integrity_missing_payload",
     "integrity_decode_error",

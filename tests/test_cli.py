@@ -407,3 +407,53 @@ class FluxeraCliTests(unittest.TestCase):
         payload = orjson.loads(stdout.getvalue())
         self.assertTrue(payload["exists"])
         self.assertEqual(payload["record"]["resolution_state"], "purged")
+
+    def test_monitor_snapshot_reports_worker_and_queue_state(self) -> None:
+        namespace = self.unique_namespace()
+
+        async def seed_runtime_state() -> None:
+            broker = fluxera.RedisBroker(self.redis_url, namespace=namespace)
+
+            @fluxera.actor(broker=broker, actor_name="cli_monitor", queue_name="default")
+            async def noop(value: str) -> None:
+                del value
+
+            await broker.ensure_serving_revision("default", "rev-monitor")
+            await broker.register_worker_revision(
+                worker_id="worker-monitor",
+                worker_revision="rev-monitor",
+                queue_states={"default": "accepting"},
+                runtime_state={
+                    "worker_status": "running",
+                    "in_flight": 2,
+                    "ready_backlog": 3,
+                    "completed_total": 10,
+                },
+            )
+            await noop.send("queued")
+            await broker.close()
+
+        asyncio.run(seed_runtime_state())
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "monitor",
+                    "snapshot",
+                    "--redis-url",
+                    self.redis_url,
+                    "--namespace",
+                    namespace,
+                    "--format",
+                    "json",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        payload = orjson.loads(stdout.getvalue())
+        self.assertEqual(payload["namespace"], namespace)
+        self.assertEqual(payload["totals"]["workers_total"], 1)
+        self.assertEqual(payload["totals"]["queues_total"], 1)
+        self.assertEqual(payload["workers"][0]["worker_id"], "worker-monitor")
+        self.assertEqual(payload["workers"][0]["runtime"]["in_flight"], 2)
+        self.assertEqual(payload["queues"][0]["queue_name"], "default")
