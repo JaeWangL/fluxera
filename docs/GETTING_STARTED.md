@@ -205,6 +205,81 @@ health checks pass.
 
 For the full model and rollout lifecycle, see [REVISION_MANAGEMENT.md](REVISION_MANAGEMENT.md).
 
+## Runtime Monitoring And `/admin` Dashboard
+
+Fluxera can expose worker and queue runtime state without extra dependencies.
+
+Read a snapshot from Redis:
+
+```bash
+fluxera monitor snapshot \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --namespace my-app \
+  --format json
+```
+
+Serve a lightweight dashboard:
+
+```bash
+fluxera monitor serve \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --namespace my-app \
+  --host 0.0.0.0 \
+  --port 8090
+```
+
+Then open:
+
+- `http://localhost:8090/admin` for the dashboard
+- `http://localhost:8090/admin/snapshot` for raw JSON
+- `http://localhost:8090/healthz` for health probes
+
+Python admin surface is also available:
+
+```python
+import asyncio
+import fluxera
+
+
+snapshot = asyncio.run(
+    fluxera.get_runtime_status(
+        "redis://127.0.0.1:6379/15",
+        namespace="my-app",
+    )
+)
+print(snapshot.overall_status, snapshot.totals)
+```
+
+If you want to expose monitoring inside an existing ASGI app:
+
+```python
+from fastapi import FastAPI
+
+import fluxera
+
+
+app = FastAPI()
+fluxera.mount_admin_asgi(
+    app,
+    mount_path="/admin/fluxera",
+    redis_url="redis://127.0.0.1:6379/15",
+    namespace="my-app",
+)
+```
+
+Now the same root server serves:
+
+- `/admin/fluxera/`
+- `/admin/fluxera/snapshot`
+- `/admin/fluxera/healthz`
+
+Important fields in the snapshot:
+
+- `workers[*].status`: `online` or `stale`
+- `queues[*].waiting_not_running`: enqueued but not currently executing
+- `queues[*].pending_stale`: pending deliveries idle beyond the threshold
+- `queues[*].status`: `ok`, `stalled`, `blocked`, or `orphaned_pending`
+
 ## Retry And Callback Examples
 
 Fluxera now supports Dramatiq-style retry controls and Fluxera-native callback
@@ -286,6 +361,33 @@ async def generate_summary() -> dict[str, str]:
 
 Use callback actors when the follow-up should itself be durable and queued.
 Use callable hooks when the follow-up is local telemetry, logging, or tracing.
+
+For worker-crash recovery paths:
+
+- `on_worker_lost`: runs when a previously in-flight delivery is recovered as redelivered
+- `redelivery_policy="continue"` (default): recovered delivery runs again
+- `redelivery_policy="fail"`: recovered delivery is dead-lettered immediately
+- `Worker(on_worker_lost=..., default_redelivery_policy=...)`: sets global defaults for all actors
+
+```python
+@fluxera.actor(
+    broker=broker,
+    queue_name="default",
+    on_worker_lost=on_failure,  # can mark DB status=failed
+    redelivery_policy="fail",   # optional: skip re-run and fail fast
+)
+async def critical_task(history_id: str) -> None:
+    ...
+```
+
+```python
+worker = fluxera.Worker(
+    broker,
+    concurrency=128,
+    on_worker_lost=on_failure,
+    default_redelivery_policy="fail",
+)
+```
 
 ## Distributed Concurrency Limits
 
@@ -371,7 +473,7 @@ These cover:
 
 ## Current Limits
 
-`0.1.1` is an early alpha, so a few edges are still intentionally narrow:
+`0.1.5` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet

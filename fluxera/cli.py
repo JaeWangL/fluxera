@@ -16,12 +16,15 @@ import redis
 from .admin import (
     ensure_serving_revision,
     get_dead_letter,
+    get_runtime_status,
     get_serving_revision,
     list_dead_letters,
     promote_serving_revision,
     purge_dead_letter,
     requeue_dead_letter,
+    runtime_status_to_dict,
 )
+from .admin_server import AdminDashboardServer
 from .broker import Broker, get_broker
 from .dead_letters import DeadLetterRecord
 from .rate_limits import ConcurrentRateLimiter
@@ -76,6 +79,25 @@ def build_parser() -> argparse.ArgumentParser:
     dlq_purge_parser.add_argument("--dead-letter-id", required=True, help="Dead letter record id.")
     dlq_purge_parser.add_argument("--note", help="Optional resolution note.")
     dlq_purge_parser.set_defaults(handler=_handle_dlq_purge)
+
+    monitor_parser = subparsers.add_parser("monitor", help="Inspect worker/queue runtime state and run the admin dashboard.")
+    monitor_subparsers = monitor_parser.add_subparsers(dest="monitor_command", required=True)
+
+    monitor_snapshot_parser = monitor_subparsers.add_parser("snapshot", help="Fetch runtime state from Redis.")
+    _add_monitor_target_arguments(monitor_snapshot_parser, include_format=True)
+    monitor_snapshot_parser.set_defaults(handler=_handle_monitor_snapshot)
+
+    monitor_serve_parser = monitor_subparsers.add_parser("serve", help="Run a local /admin dashboard server.")
+    _add_monitor_target_arguments(monitor_serve_parser, include_format=False)
+    monitor_serve_parser.add_argument("--host", default="0.0.0.0", help="Bind host. Defaults to 0.0.0.0.")
+    monitor_serve_parser.add_argument("--port", type=int, default=8090, help="Bind port. Defaults to 8090.")
+    monitor_serve_parser.add_argument(
+        "--refresh-seconds",
+        type=float,
+        default=3.0,
+        help="Dashboard auto-refresh interval.",
+    )
+    monitor_serve_parser.set_defaults(handler=_handle_monitor_serve)
 
     worker_parser = subparsers.add_parser("worker", help="Run a Fluxera worker from imported modules.")
     worker_parser.add_argument(
@@ -229,6 +251,45 @@ def _add_revision_target_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_dlq_target_arguments(parser: argparse.ArgumentParser) -> None:
     _add_revision_target_arguments(parser)
+
+
+def _add_monitor_target_arguments(parser: argparse.ArgumentParser, *, include_format: bool) -> None:
+    parser.add_argument(
+        "--redis-url",
+        default=os.environ.get("FLUXERA_REDIS_URL"),
+        help="Redis connection URL. Defaults to FLUXERA_REDIS_URL.",
+    )
+    parser.add_argument(
+        "--namespace",
+        default=os.environ.get("FLUXERA_NAMESPACE", "fluxera"),
+        help="Fluxera namespace. Defaults to FLUXERA_NAMESPACE or 'fluxera'.",
+    )
+    parser.add_argument(
+        "--queue",
+        dest="queues",
+        action="append",
+        default=[],
+        help="Restrict monitoring to specific queues. Can be passed more than once.",
+    )
+    parser.add_argument(
+        "--worker-stale-after-ms",
+        type=int,
+        default=_int_env("FLUXERA_WORKER_STALE_AFTER_MS"),
+        help="Worker heartbeat staleness threshold in milliseconds.",
+    )
+    parser.add_argument(
+        "--pending-idle-threshold-ms",
+        type=int,
+        default=_int_env("FLUXERA_PENDING_IDLE_THRESHOLD_MS"),
+        help="Treat pending entries above this idle threshold as stale.",
+    )
+    if include_format:
+        parser.add_argument(
+            "--format",
+            choices=("text", "json"),
+            default="text",
+            help="Output format.",
+        )
 
 
 def _int_env(name: str) -> int | None:
@@ -583,6 +644,55 @@ async def _handle_dlq_purge(args: argparse.Namespace) -> int:
         },
     )
     return 0 if result.updated else 4
+
+
+async def _handle_monitor_snapshot(args: argparse.Namespace) -> int:
+    status = await get_runtime_status(
+        _require_redis_url(args),
+        namespace=args.namespace,
+        queues=args.queues or None,
+        worker_stale_after_ms=args.worker_stale_after_ms,
+        pending_idle_threshold_ms=args.pending_idle_threshold_ms,
+    )
+    payload = runtime_status_to_dict(status)
+    payload["healthy"] = status.overall_status == "ok"
+
+    if getattr(args, "format", "text") == "json":
+        print(orjson.dumps(payload, option=orjson.OPT_SORT_KEYS).decode("utf-8"))
+    else:
+        totals = payload["totals"]
+        print(f"namespace={payload['namespace']}")
+        print(f"overall_status={payload['overall_status']}")
+        print(f"workers_total={totals['workers_total']}")
+        print(f"workers_online={totals['workers_online']}")
+        print(f"workers_stale={totals['workers_stale']}")
+        print(f"queues_total={totals['queues_total']}")
+        print(f"waiting_not_running={totals['waiting_not_running']}")
+        print(f"pending={totals['pending']}")
+        print(f"pending_stale={totals['pending_stale']}")
+    return 0 if status.overall_status == "ok" else 2
+
+
+async def _handle_monitor_serve(args: argparse.Namespace) -> int:
+    server = AdminDashboardServer(
+        redis_url=_require_redis_url(args),
+        namespace=args.namespace,
+        host=args.host,
+        port=args.port,
+        queue_filter=args.queues or None,
+        worker_stale_after_ms=args.worker_stale_after_ms,
+        pending_idle_threshold_ms=args.pending_idle_threshold_ms,
+        refresh_seconds=args.refresh_seconds,
+    )
+    server.start()
+    print(f"admin_url=http://{args.host}:{server.port}/admin")
+    print(f"snapshot_url=http://{args.host}:{server.port}/admin/snapshot")
+    print(f"health_url=http://{args.host}:{server.port}/healthz")
+    try:
+        await _wait_for_stop_signal()
+        return 0
+    finally:
+        await asyncio.to_thread(server.stop)
 
 
 async def _handle_rate_limit_probe(args: argparse.Namespace) -> int:

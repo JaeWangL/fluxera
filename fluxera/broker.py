@@ -163,8 +163,9 @@ class Broker(ABC):
         worker_id: str,
         worker_revision: str,
         queue_states: dict[str, str],
+        runtime_state: Optional[dict[str, Any]] = None,
     ) -> None:
-        del worker_id, worker_revision, queue_states
+        del worker_id, worker_revision, queue_states, runtime_state
 
     async def unregister_worker_revision(self, *, worker_id: str, queue_names: set[str]) -> None:
         del worker_id, queue_names

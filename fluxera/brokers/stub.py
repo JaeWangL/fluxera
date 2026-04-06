@@ -28,6 +28,7 @@ class StubBroker(Broker):
         self.serving_revisions: dict[str, str] = {}
         self.worker_revisions: dict[str, str] = {}
         self.worker_queue_states: dict[str, dict[str, str]] = {}
+        self.worker_runtime_states: dict[str, dict[str, str]] = {}
 
     @property
     def dead_letters(self) -> list[DeadLetterRecord]:
@@ -85,14 +86,21 @@ class StubBroker(Broker):
         worker_id: str,
         worker_revision: str,
         queue_states: dict[str, str],
+        runtime_state: Optional[dict[str, object]] = None,
     ) -> None:
         self.worker_revisions[worker_id] = worker_revision
         self.worker_queue_states[worker_id] = queue_states.copy()
+        serialized_runtime: dict[str, str] = {}
+        if runtime_state:
+            for key, value in runtime_state.items():
+                serialized_runtime[str(key)] = str(value)
+        self.worker_runtime_states[worker_id] = serialized_runtime
 
     async def unregister_worker_revision(self, *, worker_id: str, queue_names: set[str]) -> None:
         del queue_names
         self.worker_revisions.pop(worker_id, None)
         self.worker_queue_states.pop(worker_id, None)
+        self.worker_runtime_states.pop(worker_id, None)
 
     async def flush(self, queue_name: str) -> None:
         try:

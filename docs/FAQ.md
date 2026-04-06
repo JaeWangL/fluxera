@@ -134,3 +134,25 @@ That is what could eventually surface as:
 
 The current sync producer path fixes that by using a proper sync Redis client
 for sync enqueue operations.
+
+## How do I mark business records as failed when a worker dies mid-task?
+
+Use the actor-level redelivery hooks:
+
+- `on_worker_lost`: invoked when Fluxera recovers a stale pending delivery
+- `redelivery_policy="fail"`: optional fail-fast mode that dead-letters the recovered delivery immediately
+
+Example:
+
+```python
+@fluxera.actor(
+    on_worker_lost=mark_history_failed,
+    redelivery_policy="fail",
+)
+async def generate_problem(history_id: str) -> None:
+    ...
+```
+
+If you want automatic re-run behavior, keep the default
+`redelivery_policy="continue"` and use `on_worker_lost` only for observability
+or compensating state updates.
