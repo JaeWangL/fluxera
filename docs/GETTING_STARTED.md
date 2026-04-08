@@ -389,6 +389,29 @@ worker = fluxera.Worker(
 )
 ```
 
+## Current Worker State
+
+Inside actor code, you can inspect current execution metadata:
+
+```python
+import fluxera
+
+
+@fluxera.actor
+async def run_job(job_id: str) -> None:
+    state = fluxera.get_current_worker_state()
+    if state is None:
+        return
+
+    if state.is_retry:
+        print("retry", state.attempt, state.message_id)
+    else:
+        print("first attempt", state.message_id)
+```
+
+See [CURRENT_WORKER_STATE.md](CURRENT_WORKER_STATE.md) for all fields and
+lane-specific behavior.
+
 ## Distributed Concurrency Limits
 
 Use `ConcurrentRateLimiter` when only one worker, or a small fixed number of
@@ -473,7 +496,7 @@ These cover:
 
 ## Current Limits
 
-`0.1.5` is an early alpha, so a few edges are still intentionally narrow:
+`0.1.6` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet

@@ -100,6 +100,73 @@ class _RedeliverOnceStubBroker(fluxera.StubBroker):
 
 
 class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_current_worker_state_is_none_outside_actor(self) -> None:
+        self.assertIsNone(fluxera.get_current_worker_state())
+
+    async def test_current_worker_state_available_for_async_actor(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        seen: list[fluxera.CurrentWorkerState] = []
+
+        @fluxera.actor
+        async def observe_async() -> None:
+            state = fluxera.get_current_worker_state()
+            self.assertIsNotNone(state)
+            assert state is not None
+            seen.append(state)
+
+        async with fluxera.Worker(broker, concurrency=1):
+            await observe_async.send()
+            await broker.join(observe_async.queue_name)
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].actor_name, observe_async.actor_name)
+        self.assertEqual(seen[0].queue_name, observe_async.queue_name)
+        self.assertEqual(seen[0].attempt, 0)
+        self.assertTrue(seen[0].is_first_attempt)
+        self.assertFalse(seen[0].is_retry)
+        self.assertFalse(seen[0].redelivered)
+        self.assertEqual(seen[0].execution_mode, "async")
+
+    async def test_current_worker_state_available_for_thread_actor(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        seen: list[fluxera.CurrentWorkerState] = []
+
+        @fluxera.actor
+        def observe_thread() -> None:
+            state = fluxera.get_current_worker_state()
+            assert state is not None
+            seen.append(state)
+
+        async with fluxera.Worker(broker, concurrency=1, thread_concurrency=1):
+            await observe_thread.send()
+            await broker.join(observe_thread.queue_name)
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].execution_mode, "thread")
+        self.assertEqual(seen[0].attempt, 0)
+
+    async def test_current_worker_state_tracks_retry_attempt(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        attempts: list[int] = []
+
+        @fluxera.actor(max_retries=1)
+        async def flaky() -> None:
+            state = fluxera.get_current_worker_state()
+            self.assertIsNotNone(state)
+            assert state is not None
+            attempts.append(state.attempt)
+            if state.attempt == 0:
+                raise RuntimeError("retry once")
+
+        async with fluxera.Worker(broker, concurrency=1):
+            await flaky.send()
+            await broker.join(flaky.queue_name)
+
+        self.assertEqual(attempts, [0, 1])
+
     async def test_async_worker_processes_many_messages_concurrently(self) -> None:
         broker = fluxera.StubBroker()
         fluxera.set_broker(broker)

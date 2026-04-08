@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.1.5` is the current public alpha.
+`0.1.6` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -325,6 +325,29 @@ worker = fluxera.Worker(
     default_redelivery_policy="fail",
 )
 ```
+
+## Current Worker State
+
+Fluxera can expose the currently executing invocation from inside actor code:
+
+```python
+import fluxera
+
+
+@fluxera.actor
+async def generate_report(history_id: str) -> None:
+    state = fluxera.get_current_worker_state()
+    if state is None:
+        return
+
+    if state.is_first_attempt:
+        print("first attempt", state.message_id)
+    else:
+        print("retry", state.attempt, state.message_id)
+```
+
+For full field definitions and lane caveats, see
+[docs/CURRENT_WORKER_STATE.md](docs/CURRENT_WORKER_STATE.md).
 
 ## Distributed Concurrency Limits
 

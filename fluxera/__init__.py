@@ -24,6 +24,7 @@ from .admin_asgi import FluxeraAdminASGI, create_admin_asgi_app, mount_admin_asg
 from .actor import Actor, actor
 from .broker import Broker, Consumer, Delivery, get_broker, set_broker
 from .callbacks import DeadLetterContext, OutcomeContext
+from .current_state import CurrentWorkerState, get_current_worker_state
 from .dead_letters import DeadLetterRecord
 from .encoder import JSONMessageEncoder, PickleMessageEncoder
 from .errors import RateLimitExceeded
@@ -38,6 +39,7 @@ __all__ = [
     "Broker",
     "Consumer",
     "ConcurrentRateLimiter",
+    "CurrentWorkerState",
     "DeadLetterContext",
     "DeadLetterRecord",
     "DeadLetterList",
@@ -63,6 +65,7 @@ __all__ = [
     "create_admin_asgi_app",
     "get_dead_letter",
     "get_broker",
+    "get_current_worker_state",
     "get_runtime_health",
     "get_runtime_status",
     "FluxeraAdminASGI",
