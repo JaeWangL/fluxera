@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import multiprocessing as mp
@@ -20,6 +21,11 @@ import redis.exceptions as redis_exceptions
 
 from ..broker import Broker, Consumer, Delivery
 from ..callbacks import DeadLetterContext, OutcomeContext
+from ..current_state import (
+    CurrentWorkerState,
+    _reset_current_worker_state,
+    _set_current_worker_state,
+)
 from ..dead_letters import DeadLetterRecord, FailureKind
 from ..errors import ActorNotFound, RateLimitExceeded, RemoteExecutionError, WorkerError
 from ..message import current_millis
@@ -682,7 +688,8 @@ class Worker:
             return await asyncio.to_thread(fn, *args, **kwargs)
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.thread_executor, _execute_call, fn, args, kwargs)
+        context = contextvars.copy_context()
+        return await loop.run_in_executor(self.thread_executor, context.run, _execute_call, fn, args, kwargs)
 
     async def run_in_process(self, fn, *args, **kwargs):
         if self.process_concurrency <= 0:
@@ -849,10 +856,12 @@ class Worker:
         lane_permit: Optional[asyncio.Semaphore],
     ) -> None:
         lease_task = self._start_lease_heartbeat(item, record)
+        state_token = None
         try:
             record.state = "running"
             record.started_at = time.perf_counter()
             record.started_at_ms = current_millis()
+            state_token = _set_current_worker_state(self._build_current_worker_state(item, record))
 
             if item.delivery.redelivered:
                 await self._emit_outcome_callbacks(
@@ -905,6 +914,8 @@ class Worker:
             record.failed_at_ms = current_millis()
             await self._handle_failure(item, item.actor, record, exc, failure_kind="exception")
         finally:
+            if state_token is not None:
+                _reset_current_worker_state(state_token)
             if lease_task is not None:
                 lease_task.cancel()
                 await asyncio.gather(lease_task, return_exceptions=True)
@@ -1164,6 +1175,20 @@ class Worker:
             traceback_text=traceback_text,
             retry_delay_ms=record.retry_delay_ms,
             dead_letter_id=dead_letter_id,
+        )
+
+    def _build_current_worker_state(self, item: _ScheduledDelivery, record: TaskRecord) -> CurrentWorkerState:
+        return CurrentWorkerState(
+            worker_id=self.worker_id,
+            worker_revision=self.worker_revision,
+            actor_name=item.actor.actor_name,
+            queue_name=item.delivery.queue_name,
+            message_id=item.delivery.message_id,
+            execution_mode=record.execution_mode,
+            attempt=record.attempt,
+            max_retries=record.max_retries,
+            redelivered=item.delivery.redelivered,
+            timeout_ms=record.timeout_ms,
         )
 
     async def _dispatch_actor_callback(self, target: Any, payload: dict[str, Any]) -> None:
