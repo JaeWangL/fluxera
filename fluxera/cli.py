@@ -20,6 +20,7 @@ from .admin import (
     get_serving_revision,
     list_dead_letters,
     promote_serving_revision,
+    promote_serving_revision_safe,
     purge_dead_letter,
     requeue_dead_letter,
     runtime_status_to_dict,
@@ -55,6 +56,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require the current serving revision to match before promoting.",
     )
     promote_parser.set_defaults(handler=_handle_revision_promote)
+
+    promote_safe_parser = revision_subparsers.add_parser(
+        "promote-safe",
+        help="Promote after target revision workers are ready and accepting.",
+    )
+    _add_revision_target_arguments(promote_safe_parser)
+    promote_safe_parser.add_argument("--revision", required=True, help="Revision that should become serving.")
+    promote_safe_parser.add_argument(
+        "--expected-revision",
+        help="Require the current serving revision to match before promoting.",
+    )
+    promote_safe_parser.add_argument(
+        "--min-ready-workers",
+        type=int,
+        default=1,
+        help="Required online workers for target revision before promotion.",
+    )
+    promote_safe_parser.add_argument(
+        "--min-accepting-workers",
+        type=int,
+        default=1,
+        help="Required accepting workers for target revision after promotion.",
+    )
+    promote_safe_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=180.0,
+        help="Maximum time to wait for readiness/acceptance gates.",
+    )
+    promote_safe_parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=1.0,
+        help="Polling interval while waiting for gates.",
+    )
+    promote_safe_parser.add_argument(
+        "--worker-stale-after-ms",
+        type=int,
+        default=None,
+        help="Override worker staleness threshold in milliseconds.",
+    )
+    promote_safe_parser.set_defaults(handler=_handle_revision_promote_safe)
 
     dlq_parser = subparsers.add_parser("dlq", help="Inspect and manage dead letters.")
     dlq_subparsers = dlq_parser.add_subparsers(dest="dlq_command", required=True)
@@ -562,6 +605,41 @@ async def _handle_revision_promote(args: argparse.Namespace) -> int:
         },
     )
     return 0 if result.updated else 2
+
+
+async def _handle_revision_promote_safe(args: argparse.Namespace) -> int:
+    result = await promote_serving_revision_safe(
+        _require_redis_url(args),
+        namespace=args.namespace,
+        queue_name=args.queue,
+        revision=args.revision,
+        expected_revision=args.expected_revision,
+        min_ready_workers=args.min_ready_workers,
+        min_accepting_workers=args.min_accepting_workers,
+        timeout_seconds=args.timeout_seconds,
+        poll_interval_seconds=args.poll_interval_seconds,
+        worker_stale_after_ms=args.worker_stale_after_ms,
+    )
+    _emit(
+        args,
+        {
+            "namespace": result.namespace,
+            "queue": result.queue_name,
+            "requested_revision": result.requested_revision,
+            "previous_revision": result.previous_revision,
+            "serving_revision": result.serving_revision,
+            "expected_revision": result.expected_revision,
+            "updated": result.updated,
+            "pre_ready": result.pre_ready,
+            "post_accepting": result.post_accepting,
+            "timed_out": result.timed_out,
+            "ready_workers": result.ready_workers,
+            "accepting_workers": result.accepting_workers,
+            "waited_seconds": round(result.waited_seconds, 3),
+            "worker_ids": ",".join(result.worker_ids),
+        },
+    )
+    return 0 if (result.updated and result.post_accepting and not result.timed_out) else 2
 
 
 async def _handle_dlq_list(args: argparse.Namespace) -> int:

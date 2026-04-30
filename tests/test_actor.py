@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 import fluxera
@@ -63,3 +64,27 @@ class ActorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("retry_for", message.options)
         self.assertNotIn("retry_when", message.options)
         self.assertIsInstance(JSONMessageEncoder().dumps(message), bytes)
+
+    async def test_worker_handles_high_fanout_io_style_actor_load(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        processed: list[int] = []
+
+        @fluxera.actor(queue_name="fanout")
+        async def io_fanout(value: int) -> None:
+            await asyncio.gather(*(asyncio.sleep(0) for _ in range(200)))
+            processed.append(value)
+
+        async with fluxera.Worker(
+            broker,
+            concurrency=64,
+            async_concurrency=64,
+            thread_concurrency=0,
+            process_concurrency=0,
+            prefetch=64,
+        ):
+            await asyncio.gather(*(io_fanout.send(index) for index in range(200)))
+            await broker.join(io_fanout.queue_name)
+
+        self.assertEqual(len(processed), 200)
+        self.assertEqual(set(processed), set(range(200)))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -24,6 +25,24 @@ class ServingRevisionPromotion:
     serving_revision: Optional[str]
     updated: bool
     expected_revision: Optional[str] = None
+
+
+@dataclass(slots=True)
+class ServingRevisionSafePromotion:
+    namespace: str
+    queue_name: str
+    requested_revision: str
+    previous_revision: Optional[str]
+    serving_revision: Optional[str]
+    updated: bool
+    expected_revision: Optional[str]
+    pre_ready: bool
+    post_accepting: bool
+    timed_out: bool
+    ready_workers: int
+    accepting_workers: int
+    waited_seconds: float
+    worker_ids: list[str]
 
 
 @dataclass(slots=True)
@@ -219,6 +238,157 @@ async def promote_serving_revision(
             serving_revision=serving_revision,
             updated=updated,
             expected_revision=expected_revision,
+        )
+    finally:
+        await broker.close()
+
+
+async def promote_serving_revision_safe(
+    redis_url: str,
+    *,
+    namespace: str,
+    queue_name: str,
+    revision: str,
+    expected_revision: Optional[str] = None,
+    min_ready_workers: int = 1,
+    min_accepting_workers: int = 1,
+    timeout_seconds: float = 180.0,
+    poll_interval_seconds: float = 1.0,
+    worker_stale_after_ms: Optional[int] = None,
+) -> ServingRevisionSafePromotion:
+    broker = RedisBroker(redis_url, namespace=namespace)
+    start = time.monotonic()
+    normalized_min_ready_workers = max(int(min_ready_workers), 1)
+    normalized_min_accepting_workers = max(int(min_accepting_workers), 1)
+    normalized_timeout_seconds = max(float(timeout_seconds), 1.0)
+    normalized_poll_interval_seconds = max(float(poll_interval_seconds), 0.1)
+    effective_worker_stale_after_ms = (
+        max(int(worker_stale_after_ms), 1)
+        if worker_stale_after_ms is not None
+        else broker.worker_presence_ttl_ms * 2
+    )
+    deadline = start + normalized_timeout_seconds
+
+    async def _snapshot_workers() -> tuple[int, int, list[str]]:
+        rows = await broker.list_worker_runtime_rows(queue_names={queue_name})
+        now_ms = int(time.time() * 1000)
+        ready_workers = 0
+        accepting_workers = 0
+        worker_ids: list[str] = []
+        for row in rows:
+            if row.get("worker_revision") != revision:
+                continue
+
+            last_seen_ms = _to_int(row.get("last_seen_ms"))
+            if last_seen_ms is None or (now_ms - last_seen_ms) > effective_worker_stale_after_ms:
+                continue
+
+            worker_queues = set(_split_csv(row.get("queues")))
+            if queue_name not in worker_queues:
+                continue
+
+            ready_workers += 1
+            worker_id = row.get("worker_id")
+            if worker_id:
+                worker_ids.append(worker_id)
+
+            accepting_queues = set(_split_csv(row.get("accepting_queues")))
+            if queue_name in accepting_queues:
+                accepting_workers += 1
+
+        worker_ids.sort()
+        return ready_workers, accepting_workers, worker_ids
+
+    try:
+        previous_revision = await broker.get_serving_revision(queue_name)
+        ready_workers = 0
+        accepting_workers = 0
+        worker_ids: list[str] = []
+        pre_ready = False
+        post_accepting = False
+        timed_out = False
+
+        while True:
+            ready_workers, accepting_workers, worker_ids = await _snapshot_workers()
+            if ready_workers >= normalized_min_ready_workers:
+                pre_ready = True
+                break
+
+            if time.monotonic() >= deadline:
+                timed_out = True
+                serving_revision = await broker.get_serving_revision(queue_name)
+                return ServingRevisionSafePromotion(
+                    namespace=namespace,
+                    queue_name=queue_name,
+                    requested_revision=revision,
+                    previous_revision=previous_revision,
+                    serving_revision=serving_revision,
+                    updated=False,
+                    expected_revision=expected_revision,
+                    pre_ready=pre_ready,
+                    post_accepting=post_accepting,
+                    timed_out=timed_out,
+                    ready_workers=ready_workers,
+                    accepting_workers=accepting_workers,
+                    waited_seconds=max(time.monotonic() - start, 0.0),
+                    worker_ids=worker_ids,
+                )
+            await asyncio.sleep(normalized_poll_interval_seconds)
+
+        updated = await broker.promote_serving_revision(
+            queue_name,
+            revision,
+            expected_revision=expected_revision,
+        )
+        serving_revision = await broker.get_serving_revision(queue_name)
+        if not updated:
+            return ServingRevisionSafePromotion(
+                namespace=namespace,
+                queue_name=queue_name,
+                requested_revision=revision,
+                previous_revision=previous_revision,
+                serving_revision=serving_revision,
+                updated=False,
+                expected_revision=expected_revision,
+                pre_ready=pre_ready,
+                post_accepting=post_accepting,
+                timed_out=timed_out,
+                ready_workers=ready_workers,
+                accepting_workers=accepting_workers,
+                waited_seconds=max(time.monotonic() - start, 0.0),
+                worker_ids=worker_ids,
+            )
+
+        while True:
+            ready_workers, accepting_workers, worker_ids = await _snapshot_workers()
+            serving_revision = await broker.get_serving_revision(queue_name)
+            if (
+                serving_revision == revision
+                and accepting_workers >= normalized_min_accepting_workers
+            ):
+                post_accepting = True
+                break
+
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            await asyncio.sleep(normalized_poll_interval_seconds)
+
+        return ServingRevisionSafePromotion(
+            namespace=namespace,
+            queue_name=queue_name,
+            requested_revision=revision,
+            previous_revision=previous_revision,
+            serving_revision=serving_revision,
+            updated=updated,
+            expected_revision=expected_revision,
+            pre_ready=pre_ready,
+            post_accepting=post_accepting,
+            timed_out=timed_out,
+            ready_workers=ready_workers,
+            accepting_workers=accepting_workers,
+            waited_seconds=max(time.monotonic() - start, 0.0),
+            worker_ids=worker_ids,
         )
     finally:
         await broker.close()

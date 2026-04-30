@@ -969,12 +969,17 @@ class _RedisConsumer(Consumer):
         delivery.lease_deadline = time.time() + seconds
         delivery.metadata["lease_seconds"] = seconds
 
-    async def close(self) -> None:
-        if self._closed:
+    async def close(self, *, forget: bool = False) -> None:
+        if self._closed and not forget:
             return
 
         self._closed = True
-        self.active_ids.clear()
+        if not forget:
+            return
+
+        if self.active_ids:
+            return
+
         try:
             await self.broker.client.xgroup_delconsumer(
                 self.stream_key,

@@ -349,6 +349,7 @@ class Worker:
         }
         self.actor_permits: dict[str, asyncio.Semaphore] = {}
         self.consumers: dict[str, Consumer] = {}
+        self.opened_consumers: set[Consumer] = set()
         self.records: dict[str, TaskRecord] = {}
         self.record_history: dict[str, list[TaskRecord]] = defaultdict(list)
 
@@ -370,6 +371,8 @@ class Worker:
         self.metrics_failed_total = 0
         self.metrics_retried_total = 0
         self.metrics_dead_lettered_total = 0
+        self.metrics_revision_heartbeat_failures = 0
+        self.metrics_lease_heartbeat_failures = 0
 
         self._running = False
         self._stopping = False
@@ -419,12 +422,16 @@ class Worker:
             "ready_capacity": self._total_ready_capacity(),
             "ingress_tasks": len(self.ingress_tasks),
             "consumer_restart_tasks": len(self.consumer_restart_tasks),
+            "scheduler_tasks": sum(1 for task in self.scheduler_tasks.values() if not task.done()),
+            "revision_task": int(self.revision_task is not None and not self.revision_task.done()),
             "execution_tasks": len(self.execution_tasks),
             "completed_total": self.metrics_completed_total,
             "succeeded_total": self.metrics_succeeded_total,
             "failed_total": self.metrics_failed_total,
             "retried_total": self.metrics_retried_total,
             "dead_lettered_total": self.metrics_dead_lettered_total,
+            "revision_heartbeat_failures": self.metrics_revision_heartbeat_failures,
+            "lease_heartbeat_failures": self.metrics_lease_heartbeat_failures,
         }
 
     def _record_execution_metric(self, record: TaskRecord) -> None:
@@ -464,7 +471,60 @@ class Worker:
     async def _run_revision_heartbeat(self) -> None:
         while not self._stopping:
             await asyncio.sleep(self.revision_poll_interval)
-            await self._refresh_revision_state(bootstrap=False)
+            try:
+                await self._refresh_revision_state(bootstrap=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.metrics_revision_heartbeat_failures += 1
+                logger.warning(
+                    "Revision heartbeat failed for worker %r; retrying.",
+                    self.worker_id,
+                    exc_info=True,
+                )
+
+    def _start_revision_task(self) -> None:
+        if self.revision_task is not None and not self.revision_task.done():
+            return
+
+        self.revision_task = asyncio.create_task(
+            self._run_revision_heartbeat(),
+            name=f"fluxera-revision:{self.worker_id}",
+        )
+        self.revision_task.add_done_callback(self._on_revision_task_done)
+
+    def _on_revision_task_done(self, task: asyncio.Task[None]) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except BaseException:  # pragma: no cover - defensive logging path
+            logger.exception("Failed to inspect revision heartbeat task completion.")
+            exc = None
+
+        if self._stopping:
+            return
+
+        if exc is None:
+            logger.warning("Revision heartbeat task exited unexpectedly; restarting.")
+        else:
+            logger.warning(
+                "Revision heartbeat task crashed; restarting.",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        self._start_revision_task()
+
+    def _remember_consumer(self, consumer: Consumer) -> Consumer:
+        self.opened_consumers.add(consumer)
+        return consumer
+
+    async def _close_consumer(self, consumer: Consumer, *, forget: bool = False) -> None:
+        try:
+            await consumer.close(forget=forget)
+        except TypeError as exc:
+            if "forget" not in str(exc):
+                raise
+            await consumer.close()
 
     async def start(self) -> None:
         if self._running:
@@ -482,19 +542,17 @@ class Worker:
         queue_names = set(self.queue_filter or self.broker.get_declared_queues())
         self.managed_queues = queue_names
         await self._refresh_revision_state(bootstrap=True)
-        self.revision_task = asyncio.create_task(
-            self._run_revision_heartbeat(),
-            name=f"fluxera-revision:{self.worker_id}",
-        )
+        self._start_revision_task()
 
         for queue_name in sorted(queue_names):
-            consumer = await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
+            consumer = self._remember_consumer(
+                await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
+            )
             self.consumers[queue_name] = consumer
             self._start_consumer_task(queue_name, consumer)
 
         for execution in sorted(self.ready_queues):
-            task = asyncio.create_task(self._schedule_lane(execution), name=f"fluxera-scheduler:{execution}")
-            self.scheduler_tasks[execution] = task
+            self._start_scheduler_task(execution)
 
     async def join(self) -> None:
         while True:
@@ -512,6 +570,44 @@ class Worker:
         )
         self.ingress_tasks.add(task)
         task.add_done_callback(partial(self._on_consumer_task_done, queue_name))
+
+    def _start_scheduler_task(self, execution: str) -> None:
+        existing = self.scheduler_tasks.get(execution)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(
+            self._schedule_lane(execution),
+            name=f"fluxera-scheduler:{execution}",
+        )
+        self.scheduler_tasks[execution] = task
+        task.add_done_callback(partial(self._on_scheduler_task_done, execution))
+
+    def _on_scheduler_task_done(self, execution: str, task: asyncio.Task[None]) -> None:
+        current = self.scheduler_tasks.get(execution)
+        if current is task:
+            self.scheduler_tasks.pop(execution, None)
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except BaseException:  # pragma: no cover - defensive logging path
+            logger.exception("Failed to inspect scheduler task completion for lane %r.", execution)
+            exc = None
+
+        if self._stopping:
+            return
+
+        if exc is None:
+            logger.warning("Scheduler task for lane %r exited unexpectedly; restarting.", execution)
+        else:
+            logger.warning(
+                "Scheduler task for lane %r crashed; restarting.",
+                execution,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        self._start_scheduler_task(execution)
 
     def _on_consumer_task_done(self, queue_name: str, task: asyncio.Task[None]) -> None:
         self.ingress_tasks.discard(task)
@@ -585,7 +681,7 @@ class Worker:
             old_consumer = self.consumers.get(queue_name)
             if old_consumer is not None:
                 try:
-                    await old_consumer.close()
+                    await self._close_consumer(old_consumer, forget=True)
                 except BaseException:  # pragma: no cover - close failures are non-fatal
                     logger.warning(
                         "Failed to close previous consumer for queue %r during restart.",
@@ -594,7 +690,9 @@ class Worker:
                     )
 
             try:
-                consumer = await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
+                consumer = self._remember_consumer(
+                    await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
+                )
             except BaseException:
                 logger.warning(
                     "Failed to reopen consumer for queue %r; retrying in %.3fs.",
@@ -613,7 +711,7 @@ class Worker:
 
     async def _reopen_consumer(self, queue_name: str, consumer: Consumer) -> Consumer:
         try:
-            await consumer.close()
+            await self._close_consumer(consumer, forget=True)
         except BaseException:  # pragma: no cover - close failures are non-fatal
             logger.warning(
                 "Failed to close consumer for queue %r before reopening.",
@@ -621,7 +719,9 @@ class Worker:
                 exc_info=True,
             )
 
-        new_consumer = await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
+        new_consumer = self._remember_consumer(
+            await self.broker.open_consumer(queue_name, prefetch=self.prefetch)
+        )
         self.consumers[queue_name] = new_consumer
         return new_consumer
 
@@ -661,9 +761,10 @@ class Worker:
             await asyncio.gather(*self.scheduler_tasks.values(), return_exceptions=True)
             self.scheduler_tasks.clear()
 
-        for consumer in list(self.consumers.values()):
-            await consumer.close()
+        for consumer in list(self.opened_consumers):
+            await self._close_consumer(consumer, forget=True)
         self.consumers.clear()
+        self.opened_consumers.clear()
 
         await self.broker.unregister_worker_revision(worker_id=self.worker_id, queue_names=self.managed_queues.copy())
         self.managed_queues.clear()
@@ -837,7 +938,13 @@ class Worker:
                     name=f"fluxera-exec:{item.actor.actor_name}:{item.delivery.message_id}",
                 )
                 self.execution_tasks.add(task)
-                task.add_done_callback(self.execution_tasks.discard)
+                task.add_done_callback(
+                    partial(
+                        self._on_execution_task_done,
+                        item.actor.actor_name,
+                        item.delivery.message_id,
+                    )
+                )
             except BaseException:
                 if lane_permit is not None:
                     lane_permit.release()
@@ -847,6 +954,29 @@ class Worker:
                     self.admission_permits.release()
                 ready_queue.task_done()
                 raise
+
+    def _on_execution_task_done(
+        self,
+        actor_name: str,
+        message_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        self.execution_tasks.discard(task)
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except BaseException:  # pragma: no cover - defensive logging path
+            logger.exception("Failed to inspect execution task completion for %r.", message_id)
+            return
+
+        if exc is not None:
+            logger.warning(
+                "Execution task for actor %r message %r crashed after admission.",
+                actor_name,
+                message_id,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
     async def _execute(
         self,
@@ -972,8 +1102,14 @@ class Worker:
                 await item.consumer.extend_lease(item.delivery, seconds=lease_seconds)
             except asyncio.CancelledError:
                 raise
-            except BaseException:
-                return
+            except Exception:
+                self.metrics_lease_heartbeat_failures += 1
+                logger.warning(
+                    "Lease heartbeat failed for actor %r message %r; retrying.",
+                    item.actor.actor_name,
+                    item.delivery.message_id,
+                    exc_info=True,
+                )
             else:
                 record.lease_deadline = item.delivery.lease_deadline
 

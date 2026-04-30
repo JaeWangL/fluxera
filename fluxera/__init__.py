@@ -18,7 +18,9 @@ from .admin import (
     ensure_serving_revision,
     get_serving_revision,
     promote_serving_revision,
+    promote_serving_revision_safe,
     runtime_status_to_dict,
+    ServingRevisionSafePromotion,
 )
 from .admin_asgi import FluxeraAdminASGI, create_admin_asgi_app, mount_admin_asgi
 from .actor import Actor, actor
@@ -55,6 +57,7 @@ __all__ = [
     "QueueRuntimeStatus",
     "RuntimeStatus",
     "ServingRevisionPromotion",
+    "ServingRevisionSafePromotion",
     "ServingRevisionStatus",
     "StubBroker",
     "TaskRecord",
@@ -73,6 +76,7 @@ __all__ = [
     "mount_admin_asgi",
     "get_serving_revision",
     "promote_serving_revision",
+    "promote_serving_revision_safe",
     "purge_dead_letter",
     "requeue_dead_letter",
     "runtime_status_to_dict",

@@ -58,8 +58,9 @@ class Consumer(ABC):
     async def extend_lease(self, delivery: Delivery, *, seconds: float) -> None:
         """Extend a delivery lease when the broker supports it."""
 
-    async def close(self) -> None:
+    async def close(self, *, forget: bool = False) -> None:
         """Close any transport resources held by the consumer."""
+        del forget
 
 
 class Broker(ABC):

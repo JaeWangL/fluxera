@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.1.6` is the current public alpha.
+`0.2.1` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -101,6 +101,38 @@ For `RedisBroker`, `send_sync()` now uses a real synchronous Redis producer
 path. It is safe for normal blocking contexts such as schedulers, CLI tools,
 and plain threads, but it still intentionally rejects calls made from inside an
 already-running event loop.
+
+## Scheduler Integration (APScheduler)
+
+Fluxera can be used with APScheduler in the same style as Dramatiq.
+
+```python
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+
+def enqueue_check_stale_documents() -> None:
+    check_stale_documents.send_sync()
+
+
+scheduler = BlockingScheduler(timezone="Asia/Seoul")
+scheduler.add_job(
+    enqueue_check_stale_documents,
+    IntervalTrigger(minutes=30),
+    id="check_stale_documents",
+    replace_existing=True,
+    max_instances=1,
+    coalesce=True,
+)
+scheduler.start()
+```
+
+Guarantee boundary:
+
+- APScheduler is responsible for timer firing behavior (`coalesce`, `max_instances`, misfire handling).
+- Fluxera is responsible for durable enqueue and worker execution semantics after the message is enqueued.
+- For Redis transport, Fluxera runs ack-late with lease renewal and stale reclaim (at-least-once).
+- Exactly-once side effects still require idempotent handler logic.
 
 ## Execution Model
 
