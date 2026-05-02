@@ -46,6 +46,23 @@ class ServingRevisionSafePromotion:
 
 
 @dataclass(slots=True)
+class ServingRevisionRecovery:
+    namespace: str
+    queue_name: str
+    requested_revision: str
+    previous_revision: Optional[str]
+    serving_revision: Optional[str]
+    updated: bool
+    reason: str
+    waiting_not_running: int
+    ready_workers: int
+    accepting_workers: int
+    previous_accepting_workers: int
+    worker_ids: list[str]
+    waited_seconds: float
+
+
+@dataclass(slots=True)
 class DeadLetterStatus:
     namespace: str
     queue_name: str
@@ -392,6 +409,196 @@ async def promote_serving_revision_safe(
         )
     finally:
         await broker.close()
+
+
+async def recover_blocked_serving_revisions(
+    redis_url: str,
+    *,
+    namespace: str,
+    revision: str,
+    queue_names: Optional[list[str]] = None,
+    min_ready_workers: int = 1,
+    min_accepting_workers: int = 1,
+    timeout_seconds: float = 30.0,
+    poll_interval_seconds: float = 1.0,
+    worker_stale_after_ms: Optional[int] = None,
+) -> list[ServingRevisionRecovery]:
+    broker = RedisBroker(redis_url, namespace=namespace)
+    try:
+        return await recover_blocked_serving_revisions_for_broker(
+            broker,
+            revision=revision,
+            queue_names=queue_names,
+            min_ready_workers=min_ready_workers,
+            min_accepting_workers=min_accepting_workers,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            worker_stale_after_ms=worker_stale_after_ms,
+        )
+    finally:
+        await broker.close()
+
+
+async def recover_blocked_serving_revisions_for_broker(
+    broker: Any,
+    *,
+    revision: str,
+    queue_names: Optional[list[str]] = None,
+    min_ready_workers: int = 1,
+    min_accepting_workers: int = 1,
+    timeout_seconds: float = 30.0,
+    poll_interval_seconds: float = 1.0,
+    worker_stale_after_ms: Optional[int] = None,
+) -> list[ServingRevisionRecovery]:
+    if not hasattr(broker, "list_worker_runtime_rows"):
+        raise RuntimeError("Blocked recovery requires worker runtime rows.")
+    if not hasattr(broker, "get_queue_runtime_row"):
+        raise RuntimeError("Blocked recovery requires queue runtime rows.")
+
+    normalized_min_ready_workers = max(int(min_ready_workers), 1)
+    normalized_min_accepting_workers = max(int(min_accepting_workers), 1)
+    normalized_timeout_seconds = max(float(timeout_seconds), 1.0)
+    normalized_poll_interval_seconds = max(float(poll_interval_seconds), 0.1)
+    effective_worker_stale_after_ms = (
+        max(int(worker_stale_after_ms), 1)
+        if worker_stale_after_ms is not None
+        else getattr(broker, "worker_presence_ttl_ms", 45_000) * 2
+    )
+    namespace_value = getattr(broker, "namespace", "")
+    start = time.monotonic()
+
+    if queue_names is None:
+        if not hasattr(broker, "list_runtime_queues"):
+            raise RuntimeError("queue_names are required when broker cannot list runtime queues.")
+        queue_names = await broker.list_runtime_queues()
+
+    target_queue_names = sorted(set(queue_names))
+
+    def _row_is_online(row: dict[str, Any], *, now_ms: int) -> bool:
+        last_seen_ms = _to_int(row.get("last_seen_ms"))
+        if last_seen_ms is None:
+            return True
+        return (now_ms - last_seen_ms) <= effective_worker_stale_after_ms
+
+    def _queue_set(row: dict[str, Any], field: str) -> set[str]:
+        return set(_split_csv(row.get(field)))
+
+    async def _snapshot(queue_name: str) -> tuple[dict[str, Any], int, int, int, list[str]]:
+        now_ms = int(time.time() * 1000)
+        runtime_row = await broker.get_queue_runtime_row(queue_name)
+        worker_rows = await broker.list_worker_runtime_rows(queue_names={queue_name})
+        previous_revision = runtime_row.get("serving_revision")
+        ready_worker_ids: list[str] = []
+        ready_workers = 0
+        accepting_workers = 0
+        previous_accepting_workers = 0
+        for row in worker_rows:
+            if not _row_is_online(row, now_ms=now_ms):
+                continue
+            worker_queues = _queue_set(row, "queues")
+            accepting_queues = _queue_set(row, "accepting_queues")
+            if queue_name not in worker_queues:
+                continue
+            if row.get("worker_revision") == revision:
+                ready_workers += 1
+                worker_id = str(row.get("worker_id") or "").strip()
+                if worker_id:
+                    ready_worker_ids.append(worker_id)
+                if queue_name in accepting_queues:
+                    accepting_workers += 1
+            if previous_revision and row.get("worker_revision") == previous_revision:
+                if queue_name in accepting_queues:
+                    previous_accepting_workers += 1
+
+        ready_worker_ids.sort()
+        return (
+            runtime_row,
+            ready_workers,
+            accepting_workers,
+            previous_accepting_workers,
+            ready_worker_ids,
+        )
+
+    async def _wait_for_accepting(queue_name: str) -> tuple[int, list[str]]:
+        deadline = time.monotonic() + normalized_timeout_seconds
+        accepting_workers = 0
+        worker_ids: list[str] = []
+        while True:
+            _row, ready_workers, accepting_workers, _previous_accepting, worker_ids = (
+                await _snapshot(queue_name)
+            )
+            if accepting_workers >= normalized_min_accepting_workers:
+                return accepting_workers, worker_ids
+            if ready_workers < normalized_min_ready_workers:
+                return accepting_workers, worker_ids
+            if time.monotonic() >= deadline:
+                return accepting_workers, worker_ids
+            await asyncio.sleep(normalized_poll_interval_seconds)
+
+    results: list[ServingRevisionRecovery] = []
+    for queue_name in target_queue_names:
+        (
+            runtime_row,
+            ready_workers,
+            accepting_workers,
+            previous_accepting_workers,
+            worker_ids,
+        ) = await _snapshot(queue_name)
+        previous_revision = runtime_row.get("serving_revision")
+        stream_ready = int(runtime_row.get("stream_length", 0))
+        delayed = int(runtime_row.get("delayed_count", 0))
+        waiting_not_running = stream_ready + delayed
+        reason = "not_blocked"
+        updated = False
+
+        if previous_revision == revision:
+            reason = "already_serving_revision"
+        elif waiting_not_running <= 0:
+            reason = "no_waiting_backlog"
+        elif previous_accepting_workers > 0:
+            reason = "previous_revision_still_accepting"
+        elif ready_workers < normalized_min_ready_workers:
+            reason = "target_revision_not_ready"
+        else:
+            if previous_revision is None:
+                serving_after_ensure = await broker.ensure_serving_revision(queue_name, revision)
+                updated = serving_after_ensure == revision
+            else:
+                updated = await broker.promote_serving_revision(
+                    queue_name,
+                    revision,
+                    expected_revision=previous_revision,
+                )
+            if updated:
+                accepting_workers, worker_ids = await _wait_for_accepting(queue_name)
+                reason = (
+                    "recovered"
+                    if accepting_workers >= normalized_min_accepting_workers
+                    else "promoted_but_accepting_timeout"
+                )
+            else:
+                reason = "serving_revision_changed"
+
+        serving_revision = await broker.get_serving_revision(queue_name)
+        results.append(
+            ServingRevisionRecovery(
+                namespace=namespace_value,
+                queue_name=queue_name,
+                requested_revision=revision,
+                previous_revision=previous_revision,
+                serving_revision=serving_revision,
+                updated=updated,
+                reason=reason,
+                waiting_not_running=waiting_not_running,
+                ready_workers=ready_workers,
+                accepting_workers=accepting_workers,
+                previous_accepting_workers=previous_accepting_workers,
+                worker_ids=worker_ids,
+                waited_seconds=max(time.monotonic() - start, 0.0),
+            )
+        )
+
+    return results
 
 
 async def list_dead_letters(
