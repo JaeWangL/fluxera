@@ -435,6 +435,127 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(failed_payload["updated"])
         self.assertEqual(failed_payload["serving_revision"], "rev-b")
 
+    async def test_safe_promote_times_out_when_target_revision_workers_are_not_ready(self) -> None:
+        broker = self.make_broker()
+        await broker.ensure_serving_revision("default", "rev-a")
+
+        result = await fluxera.promote_serving_revision_safe(
+            self.redis_url,
+            namespace=self.namespace,
+            queue_name="default",
+            revision="rev-b",
+            expected_revision="rev-a",
+            min_ready_workers=1,
+            min_accepting_workers=1,
+            timeout_seconds=0.2,
+            poll_interval_seconds=0.05,
+            worker_stale_after_ms=90_000,
+        )
+
+        self.assertFalse(result.updated)
+        self.assertFalse(result.pre_ready)
+        self.assertFalse(result.post_accepting)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.serving_revision, "rev-a")
+        self.assertEqual(await broker.get_serving_revision("default"), "rev-a")
+
+    async def test_safe_promote_succeeds_when_target_revision_worker_is_accepting(self) -> None:
+        broker = self.make_broker()
+        await broker.ensure_serving_revision("default", "rev-a")
+        await broker.register_worker_revision(
+            worker_id="worker-new-revision",
+            worker_revision="rev-b",
+            queue_states={"default": "accepting"},
+        )
+
+        result = await fluxera.promote_serving_revision_safe(
+            self.redis_url,
+            namespace=self.namespace,
+            queue_name="default",
+            revision="rev-b",
+            expected_revision="rev-a",
+            min_ready_workers=1,
+            min_accepting_workers=1,
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.05,
+            worker_stale_after_ms=90_000,
+        )
+
+        self.assertTrue(result.updated)
+        self.assertTrue(result.pre_ready)
+        self.assertTrue(result.post_accepting)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.serving_revision, "rev-b")
+        self.assertIn("worker-new-revision", result.worker_ids)
+        self.assertEqual(await broker.get_serving_revision("default"), "rev-b")
+
+    async def test_revision_cli_promote_safe_returns_exit_code_2_on_timeout(self) -> None:
+        broker = self.make_broker()
+        await broker.ensure_serving_revision("default", "rev-a")
+
+        timed_out = await self.run_fluxera_cli(
+            "revision",
+            "promote-safe",
+            "--redis-url",
+            self.redis_url,
+            "--namespace",
+            self.namespace,
+            "--queue",
+            "default",
+            "--revision",
+            "rev-b",
+            "--expected-revision",
+            "rev-a",
+            "--timeout-seconds",
+            "0.2",
+            "--poll-interval-seconds",
+            "0.05",
+            "--worker-stale-after-ms",
+            "90000",
+            "--format",
+            "json",
+        )
+        self.assertEqual(timed_out.returncode, 2, timed_out.stderr)
+        timed_out_payload = orjson.loads(timed_out.stdout)
+        self.assertFalse(timed_out_payload["updated"])
+        self.assertTrue(timed_out_payload["timed_out"])
+        self.assertEqual(timed_out_payload["serving_revision"], "rev-a")
+
+        await broker.register_worker_revision(
+            worker_id="worker-safe-cli",
+            worker_revision="rev-b",
+            queue_states={"default": "accepting"},
+        )
+        promoted = await self.run_fluxera_cli(
+            "revision",
+            "promote-safe",
+            "--redis-url",
+            self.redis_url,
+            "--namespace",
+            self.namespace,
+            "--queue",
+            "default",
+            "--revision",
+            "rev-b",
+            "--expected-revision",
+            "rev-a",
+            "--timeout-seconds",
+            "1",
+            "--poll-interval-seconds",
+            "0.05",
+            "--worker-stale-after-ms",
+            "90000",
+            "--format",
+            "json",
+        )
+        self.assertEqual(promoted.returncode, 0, promoted.stderr)
+        promoted_payload = orjson.loads(promoted.stdout)
+        self.assertTrue(promoted_payload["updated"])
+        self.assertTrue(promoted_payload["pre_ready"])
+        self.assertTrue(promoted_payload["post_accepting"])
+        self.assertFalse(promoted_payload["timed_out"])
+        self.assertEqual(promoted_payload["serving_revision"], "rev-b")
+
     async def test_revision_promotion_drains_unstarted_backlog_to_new_worker(self) -> None:
         broker_old = self.make_broker(consumer_name_prefix="old")
         broker_new = self.make_broker(consumer_name_prefix="new")
@@ -544,6 +665,37 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await consumer2.ack(redeliveries[0])
         await broker.join(actor.queue_name)
         await consumer1.close()
+        await consumer2.close()
+
+    async def test_closing_consumer_preserves_pending_delivery_for_reclaim(self) -> None:
+        broker = self.make_broker(lease_seconds=0.05)
+
+        async def noop() -> None:
+            return None
+
+        actor = fluxera.actor(
+            broker=broker,
+            actor_name="preserve_pending",
+            queue_name="default",
+        )(noop)
+
+        await actor.send()
+        consumer1 = await broker.open_consumer(actor.queue_name)
+        deliveries = await consumer1.receive(limit=1, timeout=1.0)
+        self.assertEqual(len(deliveries), 1)
+        await consumer1.close()
+
+        broker2 = self.make_broker(lease_seconds=0.05, consumer_name_prefix="peer")
+        consumer2 = await broker2.open_consumer(actor.queue_name)
+        await asyncio.sleep(0.08)
+        redeliveries = await consumer2.receive(limit=1, timeout=1.0)
+
+        self.assertEqual(len(redeliveries), 1)
+        self.assertTrue(redeliveries[0].redelivered)
+        self.assertEqual(redeliveries[0].message.message_id, deliveries[0].message.message_id)
+
+        await consumer2.ack(redeliveries[0])
+        await broker.join(actor.queue_name)
         await consumer2.close()
 
     async def test_worker_renews_lease_for_long_running_task(self) -> None:

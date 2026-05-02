@@ -103,6 +103,38 @@ That means `send_sync()` does not route work through the worker thread lane.
 It only enqueues a message. For `RedisBroker`, it now does that through a real
 synchronous Redis producer path.
 
+### Scheduler integration (APScheduler)
+
+If you run a blocking scheduler process, enqueue through `send_sync()`:
+
+```python
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+
+
+def enqueue_check_stale_documents() -> None:
+    check_stale_documents.send_sync()
+
+
+scheduler = BlockingScheduler(timezone="Asia/Seoul")
+scheduler.add_job(
+    enqueue_check_stale_documents,
+    IntervalTrigger(minutes=30),
+    id="check_stale_documents",
+    replace_existing=True,
+    max_instances=1,
+    coalesce=True,
+)
+scheduler.start()
+```
+
+Operational boundary:
+
+- scheduler timing stability is owned by APScheduler settings
+- enqueue durability and worker delivery semantics are owned by Fluxera
+- RedisBroker gives at-least-once after enqueue (ack-late + lease heartbeat + stale reclaim)
+- business exactly-once side effects still require idempotency in actor logic
+
 ### Sync actors
 
 Regular `def` actors default to the thread lane:
@@ -496,7 +528,7 @@ These cover:
 
 ## Current Limits
 
-`0.1.6` is an early alpha, so a few edges are still intentionally narrow:
+`0.2.1` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet

@@ -94,6 +94,7 @@ class StubBroker(Broker):
         if runtime_state:
             for key, value in runtime_state.items():
                 serialized_runtime[str(key)] = str(value)
+        serialized_runtime.setdefault("last_seen_ms", str(current_millis()))
         self.worker_runtime_states[worker_id] = serialized_runtime
 
     async def unregister_worker_revision(self, *, worker_id: str, queue_names: set[str]) -> None:
@@ -101,6 +102,55 @@ class StubBroker(Broker):
         self.worker_revisions.pop(worker_id, None)
         self.worker_queue_states.pop(worker_id, None)
         self.worker_runtime_states.pop(worker_id, None)
+
+    async def list_runtime_queues(self) -> list[str]:
+        queue_names = set(self.queues)
+        queue_names.update(self.serving_revisions)
+        queue_names.update(self.queue_objects)
+        return sorted(queue_names)
+
+    async def list_worker_runtime_rows(self, *, queue_names: Optional[set[str]] = None) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for worker_id in sorted(self.worker_revisions):
+            queue_states = self.worker_queue_states.get(worker_id, {})
+            worker_queues = set(queue_states)
+            if queue_names and not worker_queues.intersection(queue_names):
+                continue
+            row = {
+                "worker_id": worker_id,
+                "worker_revision": self.worker_revisions[worker_id],
+                "queues": ",".join(sorted(worker_queues)),
+                "accepting_queues": ",".join(
+                    sorted(queue_name for queue_name, state in queue_states.items() if state == "accepting")
+                ),
+            }
+            row.update(self.worker_runtime_states.get(worker_id, {}))
+            rows.append(row)
+        return rows
+
+    async def get_queue_runtime_row(
+        self,
+        queue_name: str,
+        *,
+        pending_idle_threshold_ms: Optional[int] = None,
+    ) -> dict[str, object]:
+        del pending_idle_threshold_ms
+        self.declare_queue(queue_name)
+        return {
+            "queue_name": queue_name,
+            "serving_revision": await self.get_serving_revision(queue_name),
+            "stream_length": self.queue_objects[queue_name].qsize(),
+            "delayed_count": len(
+                [task for task in self.delayed_tasks_by_queue[queue_name] if not task.done()]
+            ),
+            "pending_count": 0,
+            "pending_stale_count": 0,
+            "worker_ids": [
+                worker_id
+                for worker_id, queue_states in self.worker_queue_states.items()
+                if queue_name in queue_states
+            ],
+        }
 
     async def flush(self, queue_name: str) -> None:
         try:

@@ -53,8 +53,8 @@ class _FlakyConsumer(fluxera.Consumer):
     async def extend_lease(self, delivery: fluxera.Delivery, *, seconds: float) -> None:
         await self._base.extend_lease(delivery, seconds=seconds)
 
-    async def close(self) -> None:
-        await self._base.close()
+    async def close(self, *, forget: bool = False) -> None:
+        await self._base.close(forget=forget)
 
 
 class _FlakyStubBroker(fluxera.StubBroker):
@@ -66,6 +66,31 @@ class _FlakyStubBroker(fluxera.StubBroker):
     async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> fluxera.Consumer:
         base = await super().open_consumer(queue_name, prefetch=prefetch)
         return _FlakyConsumer(self, queue_name, base)
+
+
+class _FlakyRevisionStubBroker(fluxera.StubBroker):
+    def __init__(self, *, fail_on_register_call: int) -> None:
+        super().__init__()
+        self.fail_on_register_call = fail_on_register_call
+        self.register_calls = 0
+
+    async def register_worker_revision(
+        self,
+        *,
+        worker_id: str,
+        worker_revision: str,
+        queue_states: dict[str, str],
+        runtime_state: dict[str, object] | None = None,
+    ) -> None:
+        self.register_calls += 1
+        if self.register_calls == self.fail_on_register_call:
+            raise OSError("temporary revision heartbeat failure")
+        await super().register_worker_revision(
+            worker_id=worker_id,
+            worker_revision=worker_revision,
+            queue_states=queue_states,
+            runtime_state=runtime_state,
+        )
 
 
 class _RedeliverOnceConsumer(fluxera.Consumer):
@@ -89,8 +114,20 @@ class _RedeliverOnceConsumer(fluxera.Consumer):
     async def extend_lease(self, delivery: fluxera.Delivery, *, seconds: float) -> None:
         await self._base.extend_lease(delivery, seconds=seconds)
 
-    async def close(self) -> None:
-        await self._base.close()
+    async def close(self, *, forget: bool = False) -> None:
+        await self._base.close(forget=forget)
+
+
+class _CrashOnceSchedulerWorker(fluxera.Worker):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.scheduler_runs = 0
+
+    async def _schedule_lane(self, execution: str) -> None:
+        self.scheduler_runs += 1
+        if self.scheduler_runs == 1:
+            raise RuntimeError("scheduler crashed once")
+        await super()._schedule_lane(execution)
 
 
 class _RedeliverOnceStubBroker(fluxera.StubBroker):
@@ -762,6 +799,60 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(broker.receive_failures[restart_task.queue_name], 1)
         self.assertEqual(processed, [9])
 
+    async def test_revision_heartbeat_failure_is_logged_and_retried(self) -> None:
+        broker = _FlakyRevisionStubBroker(fail_on_register_call=2)
+        fluxera.set_broker(broker)
+        processed: list[int] = []
+
+        @fluxera.actor(queue_name="heartbeat")
+        async def heartbeat_task(value: int) -> None:
+            processed.append(value)
+
+        worker = fluxera.Worker(
+            broker,
+            concurrency=1,
+            prefetch=1,
+            poll_timeout=0.01,
+            revision_poll_interval=0.01,
+            worker_revision="rev-heartbeat",
+        )
+        await worker.start()
+        try:
+            await wait_for_async(lambda: broker.register_calls >= 3, timeout=2.0)
+            await heartbeat_task.send(11)
+            await asyncio.wait_for(broker.join(heartbeat_task.queue_name), timeout=2.0)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(processed, [11])
+        self.assertGreaterEqual(worker.metrics_revision_heartbeat_failures, 1)
+        self.assertNotIn(worker.worker_id, broker.worker_revisions)
+
+    async def test_scheduler_lane_crash_is_supervised_and_restarted(self) -> None:
+        broker = fluxera.StubBroker()
+        fluxera.set_broker(broker)
+        processed: list[int] = []
+
+        @fluxera.actor(queue_name="scheduler")
+        async def scheduler_task(value: int) -> None:
+            processed.append(value)
+
+        worker = _CrashOnceSchedulerWorker(
+            broker,
+            concurrency=1,
+            prefetch=1,
+            poll_timeout=0.01,
+        )
+        await worker.start()
+        try:
+            await wait_for_async(lambda: worker.scheduler_runs >= 2, timeout=2.0)
+            await scheduler_task.send(13)
+            await asyncio.wait_for(broker.join(scheduler_task.queue_name), timeout=2.0)
+        finally:
+            await worker.stop()
+
+        self.assertEqual(processed, [13])
+
     async def test_revision_control_plane_bootstraps_and_promotes(self) -> None:
         broker = fluxera.StubBroker()
 
@@ -794,6 +885,105 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
         await broker.unregister_worker_revision(worker_id="stub-worker", queue_names={"default"})
         self.assertNotIn("stub-worker", broker.worker_revisions)
         self.assertNotIn("stub-worker", broker.worker_queue_states)
+
+    async def test_recover_blocked_serving_revision_promotes_ready_target(self) -> None:
+        broker = fluxera.StubBroker()
+        await broker.ensure_serving_revision("default", "rev-old")
+        await broker.send(fluxera.Message(queue_name="default", actor_name="task"))
+        await broker.register_worker_revision(
+            worker_id="new-worker",
+            worker_revision="rev-new",
+            queue_states={"default": "draining"},
+        )
+
+        async def mark_accepting() -> None:
+            await wait_for_async(lambda: broker.serving_revisions.get("default") == "rev-new")
+            await broker.register_worker_revision(
+                worker_id="new-worker",
+                worker_revision="rev-new",
+                queue_states={"default": "accepting"},
+            )
+
+        marker = asyncio.create_task(mark_accepting())
+        try:
+            results = await fluxera.recover_blocked_serving_revisions_for_broker(
+                broker,
+                revision="rev-new",
+                queue_names=["default"],
+                timeout_seconds=1.0,
+                poll_interval_seconds=0.01,
+            )
+        finally:
+            await marker
+
+        self.assertEqual(await broker.get_serving_revision("default"), "rev-new")
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].updated)
+        self.assertEqual(results[0].reason, "recovered")
+        self.assertEqual(results[0].waiting_not_running, 1)
+
+    async def test_recover_blocked_serving_revision_bootstraps_missing_revision(self) -> None:
+        broker = fluxera.StubBroker()
+        await broker.send(fluxera.Message(queue_name="default", actor_name="task"))
+        await broker.register_worker_revision(
+            worker_id="new-worker",
+            worker_revision="rev-new",
+            queue_states={"default": "draining"},
+        )
+
+        async def mark_accepting() -> None:
+            await wait_for_async(lambda: broker.serving_revisions.get("default") == "rev-new")
+            await broker.register_worker_revision(
+                worker_id="new-worker",
+                worker_revision="rev-new",
+                queue_states={"default": "accepting"},
+            )
+
+        marker = asyncio.create_task(mark_accepting())
+        try:
+            results = await fluxera.recover_blocked_serving_revisions_for_broker(
+                broker,
+                revision="rev-new",
+                queue_names=["default"],
+                timeout_seconds=1.0,
+                poll_interval_seconds=0.01,
+            )
+        finally:
+            await marker
+
+        self.assertEqual(await broker.get_serving_revision("default"), "rev-new")
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].updated)
+        self.assertEqual(results[0].reason, "recovered")
+        self.assertEqual(results[0].previous_revision, None)
+
+    async def test_recover_blocked_serving_revision_does_not_preempt_live_old_revision(self) -> None:
+        broker = fluxera.StubBroker()
+        await broker.ensure_serving_revision("default", "rev-old")
+        await broker.send(fluxera.Message(queue_name="default", actor_name="task"))
+        await broker.register_worker_revision(
+            worker_id="old-worker",
+            worker_revision="rev-old",
+            queue_states={"default": "accepting"},
+        )
+        await broker.register_worker_revision(
+            worker_id="new-worker",
+            worker_revision="rev-new",
+            queue_states={"default": "draining"},
+        )
+
+        results = await fluxera.recover_blocked_serving_revisions_for_broker(
+            broker,
+            revision="rev-new",
+            queue_names=["default"],
+            timeout_seconds=1.0,
+            poll_interval_seconds=0.01,
+        )
+
+        self.assertEqual(await broker.get_serving_revision("default"), "rev-old")
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].updated)
+        self.assertEqual(results[0].reason, "previous_revision_still_accepting")
 
     async def test_revision_promotion_drains_unstarted_backlog_to_new_worker(self) -> None:
         broker = fluxera.StubBroker()
