@@ -187,6 +187,76 @@ class FluxeraAdminASGITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orjson.loads(body)["namespace"], "unit")
 
 
+class FluxeraRuntimeDiagnosticsTests(unittest.TestCase):
+    def test_runtime_payload_includes_queue_and_worker_diagnostics(self) -> None:
+        status = fluxera.RuntimeStatus(
+            namespace="unit",
+            generated_at_ms=123,
+            overall_status="degraded",
+            totals={
+                "workers_total": 1,
+                "workers_online": 0,
+                "workers_stale": 1,
+                "queues_total": 1,
+                "stream_ready": 1,
+                "delayed": 0,
+                "pending": 0,
+                "pending_stale": 0,
+                "waiting_not_running": 1,
+            },
+            workers=[
+                fluxera.WorkerRuntimeStatus(
+                    namespace="unit",
+                    worker_id="worker-a",
+                    worker_revision="local",
+                    status="stale",
+                    last_seen_ms=1,
+                    age_ms=90_000,
+                    hostname="host-a",
+                    pid=10,
+                    queues=["default"],
+                    accepting_queues=[],
+                    runtime={
+                        "revision_heartbeat_failures": 3,
+                        "failed_total": 2,
+                        "retried_total": 1,
+                        "dead_lettered_total": 0,
+                    },
+                )
+            ],
+            queues=[
+                fluxera.QueueRuntimeStatus(
+                    namespace="unit",
+                    queue_name="default",
+                    serving_revision="rev-a",
+                    status="blocked",
+                    stream_ready=1,
+                    delayed=0,
+                    pending=0,
+                    pending_stale=0,
+                    waiting_not_running=1,
+                    workers_total=1,
+                    workers_accepting=0,
+                    workers_draining=0,
+                )
+            ],
+        )
+
+        diagnostics = fluxera.runtime_status_to_dict(status)["diagnostics"]
+
+        self.assertIn("worker_stale", diagnostics["summary"])
+        self.assertIn("zero_accepting_backlog", diagnostics["summary"])
+        self.assertIn("blocked_or_orphaned_queue", diagnostics["summary"])
+        self.assertIn("revision_heartbeat_failures", diagnostics["summary"])
+        self.assertIn("worker_task_failures", diagnostics["summary"])
+        self.assertEqual(diagnostics["queue_issues"][0]["queue_name"], "default")
+        self.assertEqual(diagnostics["stale_workers"][0]["worker_id"], "worker-a")
+        self.assertEqual(
+            diagnostics["revision_heartbeat_failures"][0]["revision_heartbeat_failures"],
+            3,
+        )
+
+
 class FluxeraAdminMountTests(unittest.TestCase):
     def test_mount_admin_asgi_mounts_app(self) -> None:
         class DummyApp:

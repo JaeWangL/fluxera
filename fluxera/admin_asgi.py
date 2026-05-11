@@ -329,6 +329,7 @@ class FluxeraAdminASGI:
                 "healthy": bool(payload.get("healthy")),
                 "generated_at_ms": payload.get("generated_at_ms"),
                 "totals": payload.get("totals", {}),
+                "diagnostics": payload.get("diagnostics", {}),
             }
             body = orjson.dumps(health_payload, option=orjson.OPT_SORT_KEYS)
             await self._send(

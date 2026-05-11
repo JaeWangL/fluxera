@@ -230,6 +230,7 @@ class _AdminDashboardHandler(BaseHTTPRequestHandler):
                     "namespace": payload["namespace"],
                     "totals": payload["totals"],
                     "generated_at_ms": payload["generated_at_ms"],
+                    "diagnostics": payload.get("diagnostics", {}),
                 },
                 status=HTTPStatus.OK if payload["healthy"] else HTTPStatus.SERVICE_UNAVAILABLE,
             )
