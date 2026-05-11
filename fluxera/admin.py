@@ -152,12 +152,130 @@ def _parse_runtime_value(raw: str) -> Any:
         return raw
 
 
+def _worker_runtime_metric(worker: WorkerRuntimeStatus, metric_name: str) -> int:
+    raw_value = worker.runtime.get(metric_name)
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _worker_summary(worker: WorkerRuntimeStatus) -> dict[str, Any]:
+    return {
+        "worker_id": worker.worker_id,
+        "worker_revision": worker.worker_revision,
+        "status": worker.status,
+        "age_ms": worker.age_ms,
+        "hostname": worker.hostname,
+        "pid": worker.pid,
+        "queues": len(worker.queues),
+        "accepting_queues": len(worker.accepting_queues),
+    }
+
+
+def _queue_issue_summary(queue: QueueRuntimeStatus) -> dict[str, Any]:
+    return {
+        "queue_name": queue.queue_name,
+        "status": queue.status,
+        "serving_revision": queue.serving_revision,
+        "waiting_not_running": queue.waiting_not_running,
+        "pending": queue.pending,
+        "pending_stale": queue.pending_stale,
+        "workers_total": queue.workers_total,
+        "workers_accepting": queue.workers_accepting,
+        "workers_draining": queue.workers_draining,
+    }
+
+
+def _runtime_diagnostics(status: RuntimeStatus) -> dict[str, Any]:
+    queue_issues = [
+        _queue_issue_summary(queue)
+        for queue in status.queues
+        if queue.status != "ok"
+    ]
+    zero_accepting_backlog = [
+        _queue_issue_summary(queue)
+        for queue in status.queues
+        if queue.waiting_not_running > 0 and queue.workers_accepting == 0
+    ]
+    stale_workers = [
+        _worker_summary(worker)
+        for worker in status.workers
+        if worker.status == "stale"
+    ]
+    draining_only_workers = [
+        _worker_summary(worker)
+        for worker in status.workers
+        if worker.queues and not worker.accepting_queues
+    ]
+    revision_heartbeat_failures = [
+        {
+            **_worker_summary(worker),
+            "revision_heartbeat_failures": _worker_runtime_metric(worker, "revision_heartbeat_failures"),
+        }
+        for worker in status.workers
+        if _worker_runtime_metric(worker, "revision_heartbeat_failures") > 0
+    ]
+    lease_heartbeat_failures = [
+        {
+            **_worker_summary(worker),
+            "lease_heartbeat_failures": _worker_runtime_metric(worker, "lease_heartbeat_failures"),
+        }
+        for worker in status.workers
+        if _worker_runtime_metric(worker, "lease_heartbeat_failures") > 0
+    ]
+    worker_failures = [
+        {
+            **_worker_summary(worker),
+            "failed_total": _worker_runtime_metric(worker, "failed_total"),
+            "retried_total": _worker_runtime_metric(worker, "retried_total"),
+            "dead_lettered_total": _worker_runtime_metric(worker, "dead_lettered_total"),
+        }
+        for worker in status.workers
+        if (
+            _worker_runtime_metric(worker, "failed_total") > 0
+            or _worker_runtime_metric(worker, "retried_total") > 0
+            or _worker_runtime_metric(worker, "dead_lettered_total") > 0
+        )
+    ]
+
+    summary: list[str] = []
+    if status.totals.get("workers_stale", 0) > 0:
+        summary.append("worker_stale")
+    if zero_accepting_backlog:
+        summary.append("zero_accepting_backlog")
+    if any(queue["status"] in {"blocked", "orphaned_pending"} for queue in queue_issues):
+        summary.append("blocked_or_orphaned_queue")
+    if any(queue["status"] == "stalled" for queue in queue_issues):
+        summary.append("pending_stale")
+    if revision_heartbeat_failures:
+        summary.append("revision_heartbeat_failures")
+    if lease_heartbeat_failures:
+        summary.append("lease_heartbeat_failures")
+    if worker_failures:
+        summary.append("worker_task_failures")
+    if status.overall_status != "ok" and not summary:
+        summary.append("unknown_runtime_degradation")
+
+    return {
+        "summary": summary,
+        "queue_issues": queue_issues,
+        "zero_accepting_backlog": zero_accepting_backlog,
+        "stale_workers": stale_workers,
+        "draining_only_workers": draining_only_workers,
+        "revision_heartbeat_failures": revision_heartbeat_failures,
+        "lease_heartbeat_failures": lease_heartbeat_failures,
+        "worker_failures": worker_failures,
+    }
+
+
 def _runtime_payload(status: RuntimeStatus) -> dict[str, Any]:
     return {
         "namespace": status.namespace,
         "generated_at_ms": status.generated_at_ms,
         "overall_status": status.overall_status,
         "totals": status.totals,
+        "diagnostics": _runtime_diagnostics(status),
         "workers": [
             {
                 "namespace": worker.namespace,
