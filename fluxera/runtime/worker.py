@@ -37,8 +37,31 @@ if TYPE_CHECKING:
 DEFAULT_PROCESS_START_METHOD = "spawn"
 DEFAULT_RETRY_JITTER = "full"
 DEFAULT_RATE_LIMIT_DEFER_MS = 1_000
+DEFAULT_CONSUMER_IDLE_BACKOFF_MAX_SECONDS = 1.0
+DEFAULT_CONSUMER_IDLE_BACKOFF_MULTIPLIER = 2.0
+DEFAULT_MAX_CONCURRENT_CONSUMER_RECEIVES = 16
 
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {raw!r}.") from exc
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}.") from exc
 
 
 def _execute_call(fn, args, kwargs):
@@ -284,6 +307,9 @@ class Worker:
         prefetch: Optional[int] = None,
         ready_queue_size: Optional[int] = None,
         poll_timeout: float = 0.1,
+        consumer_idle_backoff_max: Optional[float] = None,
+        consumer_idle_backoff_multiplier: Optional[float] = None,
+        max_concurrent_consumer_receives: Optional[int] = None,
         process_start_method: Optional[str] = None,
         worker_revision: Optional[str] = None,
         worker_id: Optional[str] = None,
@@ -319,7 +345,30 @@ class Worker:
 
         self.prefetch = prefetch or min(max(self.max_in_flight, 1), 256)
         self.ready_queue_size = ready_queue_size
-        self.poll_timeout = poll_timeout
+        self.poll_timeout = max(float(poll_timeout), 0.001)
+        if consumer_idle_backoff_max is None:
+            consumer_idle_backoff_max = _env_float(
+                "FLUXERA_CONSUMER_IDLE_BACKOFF_MAX_SECONDS",
+                DEFAULT_CONSUMER_IDLE_BACKOFF_MAX_SECONDS,
+            )
+        if consumer_idle_backoff_multiplier is None:
+            consumer_idle_backoff_multiplier = _env_float(
+                "FLUXERA_CONSUMER_IDLE_BACKOFF_MULTIPLIER",
+                DEFAULT_CONSUMER_IDLE_BACKOFF_MULTIPLIER,
+            )
+        if max_concurrent_consumer_receives is None:
+            max_concurrent_consumer_receives = _env_int(
+                "FLUXERA_MAX_CONCURRENT_CONSUMER_RECEIVES",
+                DEFAULT_MAX_CONCURRENT_CONSUMER_RECEIVES,
+            )
+        self.consumer_idle_backoff_max = max(float(consumer_idle_backoff_max), 0.0)
+        self.consumer_idle_backoff_multiplier = max(float(consumer_idle_backoff_multiplier), 1.0)
+        self.max_concurrent_consumer_receives = int(max_concurrent_consumer_receives)
+        self.consumer_receive_permits = (
+            asyncio.Semaphore(self.max_concurrent_consumer_receives)
+            if self.max_concurrent_consumer_receives > 0
+            else None
+        )
         self.process_start_method = (
             process_start_method
             or os.environ.get("FLUXERA_PROCESS_START_METHOD")
@@ -425,6 +474,8 @@ class Worker:
             "scheduler_tasks": sum(1 for task in self.scheduler_tasks.values() if not task.done()),
             "revision_task": int(self.revision_task is not None and not self.revision_task.done()),
             "execution_tasks": len(self.execution_tasks),
+            "max_concurrent_consumer_receives": self.max_concurrent_consumer_receives,
+            "consumer_idle_backoff_max": self.consumer_idle_backoff_max,
             "completed_total": self.metrics_completed_total,
             "succeeded_total": self.metrics_succeeded_total,
             "failed_total": self.metrics_failed_total,
@@ -818,21 +869,29 @@ class Worker:
             ) from exc
 
     async def _consume(self, queue_name: str, consumer: Consumer) -> None:
+        idle_delay = self.poll_timeout
         while not self._stopping:
             if not self._accepts_queue(queue_name):
                 await asyncio.sleep(self.poll_timeout)
+                idle_delay = self.poll_timeout
                 continue
 
-            available_slots = self.max_in_flight - self.in_flight - self._total_ready_backlog()
-            local_capacity = self._total_ready_capacity()
-            batch_size = min(self.prefetch, max(available_slots, 0), max(local_capacity, 0))
+            batch_size = self._available_consumer_batch_size()
 
             if batch_size <= 0:
                 await asyncio.sleep(self.poll_timeout)
+                idle_delay = self.poll_timeout
                 continue
 
             try:
-                deliveries = await consumer.receive(limit=batch_size, timeout=self.poll_timeout)
+                if self.consumer_receive_permits is None:
+                    deliveries = await consumer.receive(limit=batch_size, timeout=self.poll_timeout)
+                else:
+                    async with self.consumer_receive_permits:
+                        batch_size = self._available_consumer_batch_size()
+                        if batch_size <= 0:
+                            continue
+                        deliveries = await consumer.receive(limit=batch_size, timeout=self.poll_timeout)
             except (
                 redis_exceptions.TimeoutError,
                 redis_exceptions.ConnectionError,
@@ -856,7 +915,18 @@ class Worker:
                         exc_info=True,
                     )
                 await asyncio.sleep(self.poll_timeout)
+                idle_delay = self.poll_timeout
                 continue
+
+            if deliveries:
+                idle_delay = self.poll_timeout
+            elif self.consumer_idle_backoff_max > 0:
+                sleep_for = min(idle_delay, self.consumer_idle_backoff_max)
+                await asyncio.sleep(sleep_for)
+                idle_delay = min(
+                    self.consumer_idle_backoff_max,
+                    max(self.poll_timeout, idle_delay * self.consumer_idle_backoff_multiplier),
+                )
 
             for delivery in deliveries:
                 try:
@@ -888,6 +958,11 @@ class Worker:
                     continue
 
                 await ready_queue.put(_ScheduledDelivery(consumer=consumer, delivery=delivery, actor=actor))
+
+    def _available_consumer_batch_size(self) -> int:
+        available_slots = self.max_in_flight - self.in_flight - self._total_ready_backlog()
+        local_capacity = self._total_ready_capacity()
+        return min(self.prefetch, max(available_slots, 0), max(local_capacity, 0))
 
     async def _schedule_lane(self, execution: str) -> None:
         ready_queue = self.ready_queues[execution]

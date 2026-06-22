@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 import orjson
 
-from .admin import get_runtime_status, runtime_status_to_dict
+from .admin import get_redis_readiness, get_runtime_status, runtime_status_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +174,7 @@ class _AdminDashboardHandler(BaseHTTPRequestHandler):
     worker_stale_after_ms: Optional[int] = None
     pending_idle_threshold_ms: Optional[int] = None
     refresh_seconds: float = 3.0
+    readiness_timeout_seconds: float = 2.0
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003 - stdlib method name
         logger.info("fluxera-admin %s - %s", self.address_string(), format % args)
@@ -216,22 +217,24 @@ class _AdminDashboardHandler(BaseHTTPRequestHandler):
         payload["healthy"] = status.overall_status == "ok"
         return payload
 
+    def _load_readiness_payload(self) -> dict:
+        return asyncio.run(
+            get_redis_readiness(
+                self.redis_url,
+                namespace=self.namespace,
+                timeout_seconds=self.readiness_timeout_seconds,
+            )
+        )
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
         query_params = parse_qs(parsed.query)
         queues = self._resolve_queues(query_params)
 
         if parsed.path in {"/health", "/healthz"}:
-            payload = self._load_runtime_payload(queues=queues)
+            payload = self._load_readiness_payload()
             self._json_response(
-                {
-                    "status": payload["overall_status"],
-                    "healthy": payload["healthy"],
-                    "namespace": payload["namespace"],
-                    "totals": payload["totals"],
-                    "generated_at_ms": payload["generated_at_ms"],
-                    "diagnostics": payload.get("diagnostics", {}),
-                },
+                payload,
                 status=HTTPStatus.OK if payload["healthy"] else HTTPStatus.SERVICE_UNAVAILABLE,
             )
             return
@@ -263,6 +266,7 @@ class AdminDashboardServer:
         worker_stale_after_ms: Optional[int] = None,
         pending_idle_threshold_ms: Optional[int] = None,
         refresh_seconds: float = 3.0,
+        readiness_timeout_seconds: float = 2.0,
     ) -> None:
         handler = type(
             "FluxeraAdminHandler",
@@ -274,6 +278,7 @@ class AdminDashboardServer:
                 "worker_stale_after_ms": worker_stale_after_ms,
                 "pending_idle_threshold_ms": pending_idle_threshold_ms,
                 "refresh_seconds": refresh_seconds,
+                "readiness_timeout_seconds": readiness_timeout_seconds,
             },
         )
         self._server = ThreadingHTTPServer((host, port), handler)

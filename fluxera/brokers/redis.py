@@ -18,11 +18,42 @@ from ..errors import QueueNotFound
 from ..message import Message
 from .redis_scripts import RedisLuaScripts
 
+DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 2.0
+DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS = 5.0
+DEFAULT_REDIS_SOCKET_KEEPALIVE = True
+DEFAULT_REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
+DEFAULT_REDIS_MAX_CONNECTIONS = 96
+DEFAULT_REDIS_CONNECTION_POOL_TIMEOUT_SECONDS = 2.0
+DEFAULT_REDIS_PROMOTE_DUE_INTERVAL_SECONDS = 0.25
+DEFAULT_REDIS_STALE_CLAIM_INTERVAL_MAX_SECONDS = 5.0
+DEFAULT_REDIS_STALE_CLAIM_INTERVAL_MIN_SECONDS = 0.1
+
 
 def _normalize_error_message(exc: ResponseError) -> str:
     if not exc.args:
         return ""
     return str(exc.args[0])
+
+
+def _is_busy_group_error(exc: ResponseError) -> bool:
+    return "BUSYGROUP" in _normalize_error_message(exc).upper()
+
+
+def _is_missing_group_error(exc: ResponseError) -> bool:
+    message = _normalize_error_message(exc).upper()
+    return "NOGROUP" in message or "NO SUCH KEY" in message
+
+
+def _default_client_name(namespace: str) -> str:
+    hostname = os.uname().nodename if hasattr(os, "uname") else "unknown-host"
+    return f"fluxera:{namespace}:{hostname}:{os.getpid()}"
+
+
+def _default_stale_claim_interval(lease_seconds: float) -> float:
+    return min(
+        max(float(lease_seconds) * 0.5, DEFAULT_REDIS_STALE_CLAIM_INTERVAL_MIN_SECONDS),
+        DEFAULT_REDIS_STALE_CLAIM_INTERVAL_MAX_SECONDS,
+    )
 
 
 class RedisBroker(Broker):
@@ -41,6 +72,15 @@ class RedisBroker(Broker):
         consumer_name_prefix: str = "fluxera",
         message_ttl_seconds: float = 86_400.0,
         dead_letter_ttl_seconds: float = 604_800.0,
+        socket_connect_timeout: Optional[float] = DEFAULT_REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+        socket_timeout: Optional[float] = DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS,
+        socket_keepalive: bool = DEFAULT_REDIS_SOCKET_KEEPALIVE,
+        health_check_interval: int = DEFAULT_REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+        max_connections: int = DEFAULT_REDIS_MAX_CONNECTIONS,
+        connection_pool_timeout: float = DEFAULT_REDIS_CONNECTION_POOL_TIMEOUT_SECONDS,
+        client_name: Optional[str] = None,
+        promote_due_interval_seconds: float = DEFAULT_REDIS_PROMOTE_DUE_INTERVAL_SECONDS,
+        stale_claim_interval_seconds: Optional[float] = None,
         encoder: Optional[MessageEncoder] = None,
     ) -> None:
         super().__init__()
@@ -54,11 +94,54 @@ class RedisBroker(Broker):
         self.consumer_name_prefix = consumer_name_prefix
         self.message_ttl_seconds = max(float(message_ttl_seconds), self.lease_seconds, 1.0)
         self.dead_letter_ttl_seconds = max(float(dead_letter_ttl_seconds), 1.0)
+        self.promote_due_interval_seconds = max(float(promote_due_interval_seconds), 0.0)
+        self.stale_claim_interval_seconds = (
+            _default_stale_claim_interval(self.lease_seconds)
+            if stale_claim_interval_seconds is None
+            else max(float(stale_claim_interval_seconds), 0.0)
+        )
         self.encoder = encoder or JSONMessageEncoder()
-        self.client = redis.from_url(url, decode_responses=False)
-        self.sync_client = sync_redis.Redis.from_url(url, decode_responses=False)
+        self.socket_connect_timeout = (
+            None
+            if socket_connect_timeout is None
+            else max(float(socket_connect_timeout), 0.001)
+        )
+        self.socket_timeout = (
+            None
+            if socket_timeout is None
+            else max(float(socket_timeout), 0.001)
+        )
+        self.socket_keepalive = bool(socket_keepalive)
+        self.health_check_interval = max(int(health_check_interval), 0)
+        self.max_connections = max(int(max_connections), 1)
+        self.connection_pool_timeout = max(float(connection_pool_timeout), 0.0)
+        self.client_name = client_name or _default_client_name(self.namespace)
+        common_connection_kwargs = {
+            "decode_responses": False,
+            "socket_connect_timeout": self.socket_connect_timeout,
+            "socket_timeout": self.socket_timeout,
+            "socket_keepalive": self.socket_keepalive,
+            "health_check_interval": self.health_check_interval,
+        }
+        async_pool = redis.BlockingConnectionPool.from_url(
+            url,
+            max_connections=self.max_connections,
+            timeout=self.connection_pool_timeout,
+            client_name=f"{self.client_name}:async",
+            **common_connection_kwargs,
+        )
+        sync_pool = sync_redis.BlockingConnectionPool.from_url(
+            url,
+            max_connections=self.max_connections,
+            timeout=self.connection_pool_timeout,
+            client_name=f"{self.client_name}:sync",
+            **common_connection_kwargs,
+        )
+        self.client = redis.Redis(connection_pool=async_pool)
+        self.sync_client = sync_redis.Redis(connection_pool=sync_pool)
         self.scripts = RedisLuaScripts(self.client)
         self.sync_scripts = RedisLuaScripts(self.sync_client)
+        self._ensured_groups: set[str] = set()
 
     @property
     def message_ttl_ms(self) -> int:
@@ -265,13 +348,22 @@ class RedisBroker(Broker):
             fence_token=fence_token,
         )
 
-    async def _ensure_group(self, queue_name: str) -> None:
+    def _forget_group(self, queue_name: str) -> None:
+        self._ensured_groups.discard(queue_name)
+
+    async def _ensure_group(self, queue_name: str, *, force: bool = False) -> None:
+        if not force and queue_name in self._ensured_groups:
+            return
+
+        await self._create_group(queue_name)
+        self._ensured_groups.add(queue_name)
+
+    async def _create_group(self, queue_name: str) -> None:
         stream_key = self._stream_key(queue_name)
         try:
             await self.client.xgroup_create(stream_key, self.group_name, id="0-0", mkstream=True)
         except ResponseError as exc:
-            message = _normalize_error_message(exc)
-            if "BUSYGROUP" not in message:
+            if not _is_busy_group_error(exc):
                 raise
 
     async def ensure_serving_revision(self, queue_name: str, worker_revision: str) -> str:
@@ -678,6 +770,7 @@ class RedisBroker(Broker):
             self._dead_letter_key(queue_name),
             *dead_letter_record_keys,
         )
+        self._forget_group(queue_name)
 
     async def join(self, queue_name: str) -> None:
         if queue_name not in self.queues:
@@ -716,8 +809,9 @@ class RedisBroker(Broker):
             await asyncio.sleep(sleep_interval)
 
     async def close(self) -> None:
-        await self.client.aclose()
+        await self.client.aclose(close_connection_pool=True)
         self.sync_client.close()
+        self.sync_client.connection_pool.disconnect()
 
 
 def _decode_stream_id(stream_id) -> str:
@@ -761,6 +855,8 @@ class _RedisConsumer(Consumer):
         self.claim_cursor = "0-0"
         self.active_ids: set[str] = set()
         self._closed = False
+        self._next_promote_due_at = 0.0
+        self._next_stale_claim_at = 0.0
 
     @property
     def lease_ms(self) -> int:
@@ -870,8 +966,9 @@ class _RedisConsumer(Consumer):
                 count=max(limit, self.broker.pending_scan_size),
             )
         except ResponseError as exc:
-            message = _normalize_error_message(exc)
-            if "NOGROUP" in message or "no such key" in message:
+            if _is_missing_group_error(exc):
+                self.broker._forget_group(self.queue_name)
+                await self.broker._ensure_group(self.queue_name, force=True)
                 return []
             raise
 
@@ -887,22 +984,48 @@ class _RedisConsumer(Consumer):
 
         return await self._build_deliveries(filtered_entries, redelivered=True)
 
-    async def receive(self, *, limit: int, timeout: Optional[float]) -> list[Delivery]:
-        await self.broker._ensure_group(self.queue_name)
-        await self.broker._promote_due(self.queue_name, limit=max(limit, self.prefetch))
+    async def _promote_due_if_due(self, *, limit: int) -> None:
+        interval = self.broker.promote_due_interval_seconds
+        now = time.monotonic()
+        if interval > 0 and now < self._next_promote_due_at:
+            return
+
+        promoted = await self.broker._promote_due(self.queue_name, limit=max(limit, self.prefetch))
+        self._next_promote_due_at = 0.0 if promoted > 0 else time.monotonic() + interval
+
+    async def _claim_stale_if_due(self, *, limit: int) -> list[Delivery]:
+        interval = self.broker.stale_claim_interval_seconds
+        now = time.monotonic()
+        if interval > 0 and now < self._next_stale_claim_at:
+            return []
 
         deliveries = await self._claim_stale(limit=limit)
+        self._next_stale_claim_at = 0.0 if deliveries else time.monotonic() + interval
+        return deliveries
+
+    async def receive(self, *, limit: int, timeout: Optional[float]) -> list[Delivery]:
+        await self.broker._ensure_group(self.queue_name)
+        await self._promote_due_if_due(limit=limit)
+
+        deliveries = await self._claim_stale_if_due(limit=limit)
         if deliveries:
             return deliveries
 
         block_ms = None if timeout is None else max(int(timeout * 1000), 1)
-        response = await self.broker.client.xreadgroup(
-            self.broker.group_name,
-            self.consumer_name,
-            {self.stream_key: ">"},
-            count=limit,
-            block=block_ms,
-        )
+        try:
+            response = await self.broker.client.xreadgroup(
+                self.broker.group_name,
+                self.consumer_name,
+                {self.stream_key: ">"},
+                count=limit,
+                block=block_ms,
+            )
+        except ResponseError as exc:
+            if _is_missing_group_error(exc):
+                self.broker._forget_group(self.queue_name)
+                await self.broker._ensure_group(self.queue_name, force=True)
+                return []
+            raise
         if not response:
             return []
 

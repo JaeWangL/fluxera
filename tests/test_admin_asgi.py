@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
+from urllib.parse import urlsplit
 
 import orjson
 
@@ -8,6 +10,7 @@ import fluxera
 
 
 async def _asgi_get(app, path: str, *, root_path: str = "") -> tuple[int, dict[str, str], bytes]:
+    parsed = urlsplit(path)
     sent_messages: list[dict] = []
     receive_events = [{"type": "http.request", "body": b"", "more_body": False}]
 
@@ -25,9 +28,9 @@ async def _asgi_get(app, path: str, *, root_path: str = "") -> tuple[int, dict[s
         "http_version": "1.1",
         "method": "GET",
         "scheme": "http",
-        "path": path,
+        "path": parsed.path,
         "root_path": root_path,
-        "query_string": b"",
+        "query_string": parsed.query.encode("utf-8"),
         "headers": [],
         "client": ("127.0.0.1", 12345),
         "server": ("127.0.0.1", 8000),
@@ -51,14 +54,28 @@ class FluxeraAdminASGITests(unittest.IsolatedAsyncioTestCase):
             "workers": [],
             "queues": [],
         }
+        readiness_payload = {
+            "namespace": "unit",
+            "generated_at_ms": 2,
+            "status": "ok",
+            "healthy": True,
+            "redis": {"ping": True, "latency_ms": 1.0},
+        }
+        snapshot_calls = 0
 
         async def snapshot_loader(_query_params):
+            nonlocal snapshot_calls
+            snapshot_calls += 1
             return payload
+
+        async def readiness_loader():
+            return readiness_payload
 
         app = fluxera.FluxeraAdminASGI(
             redis_url="redis://unused",
             namespace="unit",
             snapshot_loader=snapshot_loader,
+            readiness_loader=readiness_loader,
         )
 
         status, headers, body = await _asgi_get(app, "/")
@@ -72,21 +89,64 @@ class FluxeraAdminASGITests(unittest.IsolatedAsyncioTestCase):
         decoded = orjson.loads(body)
         self.assertEqual(decoded["namespace"], "unit")
         self.assertTrue(decoded["healthy"])
+        self.assertEqual(decoded["snapshot_cache"]["state"], "refresh")
+        self.assertEqual(snapshot_calls, 1)
 
         status, _headers, body = await _asgi_get(app, "/healthz")
         self.assertEqual(status, 200)
         decoded = orjson.loads(body)
         self.assertEqual(decoded["status"], "ok")
         self.assertTrue(decoded["healthy"])
+        self.assertEqual(decoded["redis"]["ping"], True)
+        self.assertEqual(snapshot_calls, 1)
 
     async def test_health_returns_503_when_unhealthy(self) -> None:
-        async def snapshot_loader(_query_params):
+        async def readiness_loader():
             return {
                 "namespace": "unit",
                 "generated_at_ms": 1,
-                "overall_status": "critical",
+                "status": "redis_unreachable",
                 "healthy": False,
-                "totals": {"workers_total": 0, "workers_online": 0, "workers_stale": 0, "queues_total": 1},
+                "redis": {"ping": False, "latency_ms": 1.0, "error_type": "TimeoutError"},
+            }
+
+        app = fluxera.FluxeraAdminASGI(
+            redis_url="redis://unused",
+            namespace="unit",
+            readiness_loader=readiness_loader,
+        )
+        status, _headers, _body = await _asgi_get(app, "/healthz")
+        self.assertEqual(status, 503)
+
+    async def test_health_loader_exception_returns_503_payload(self) -> None:
+        async def readiness_loader():
+            raise TimeoutError("redis ping timed out")
+
+        app = fluxera.FluxeraAdminASGI(
+            redis_url="redis://unused",
+            namespace="unit",
+            readiness_loader=readiness_loader,
+        )
+
+        status, _headers, body = await _asgi_get(app, "/healthz")
+        decoded = orjson.loads(body)
+        self.assertEqual(status, 503)
+        self.assertFalse(decoded["healthy"])
+        self.assertEqual(decoded["status"], "redis_unreachable")
+        self.assertEqual(decoded["redis"]["error_type"], "TimeoutError")
+
+    async def test_snapshot_uses_recent_success_cache(self) -> None:
+        calls = 0
+
+        async def snapshot_loader(_query_params):
+            nonlocal calls
+            calls += 1
+            return {
+                "namespace": "unit",
+                "generated_at_ms": calls,
+                "overall_status": "ok",
+                "healthy": True,
+                "totals": {"workers_total": calls},
                 "workers": [],
                 "queues": [],
             }
@@ -95,9 +155,48 @@ class FluxeraAdminASGITests(unittest.IsolatedAsyncioTestCase):
             redis_url="redis://unused",
             namespace="unit",
             snapshot_loader=snapshot_loader,
+            snapshot_cache_seconds=25,
         )
-        status, _headers, _body = await _asgi_get(app, "/healthz")
+
+        status, _headers, body = await _asgi_get(app, "/snapshot")
+        self.assertEqual(status, 200)
+        first = orjson.loads(body)
+        self.assertEqual(first["generated_at_ms"], 1)
+        self.assertEqual(first["snapshot_cache"]["state"], "refresh")
+
+        status, _headers, body = await _asgi_get(app, "/snapshot")
+        self.assertEqual(status, 200)
+        second = orjson.loads(body)
+        self.assertEqual(second["generated_at_ms"], 1)
+        self.assertEqual(second["snapshot_cache"]["state"], "hit")
+        self.assertEqual(calls, 1)
+
+    async def test_snapshot_timeout_returns_degraded_payload(self) -> None:
+        async def snapshot_loader(_query_params):
+            await asyncio.sleep(1)
+            return {
+                "namespace": "unit",
+                "generated_at_ms": 1,
+                "overall_status": "ok",
+                "healthy": True,
+                "totals": {},
+                "workers": [],
+                "queues": [],
+            }
+
+        app = fluxera.FluxeraAdminASGI(
+            redis_url="redis://unused",
+            namespace="unit",
+            snapshot_loader=snapshot_loader,
+            snapshot_timeout_seconds=0.01,
+        )
+
+        status, _headers, body = await _asgi_get(app, "/snapshot")
+        decoded = orjson.loads(body)
         self.assertEqual(status, 503)
+        self.assertFalse(decoded["healthy"])
+        self.assertEqual(decoded["overall_status"], "degraded")
+        self.assertEqual(decoded["diagnostics"]["error_type"], "TimeoutError")
 
     async def test_not_found_endpoint_returns_404(self) -> None:
         async def snapshot_loader(_query_params):
@@ -132,11 +231,21 @@ class FluxeraAdminASGITests(unittest.IsolatedAsyncioTestCase):
                 "queues": [],
             }
 
+        async def readiness_loader():
+            return {
+                "namespace": "unit",
+                "generated_at_ms": 1,
+                "status": "ok",
+                "healthy": True,
+                "redis": {"ping": True, "latency_ms": 1.0},
+            }
+
         app = fluxera.FluxeraAdminASGI(
             redis_url="redis://unused",
             namespace="unit",
             mount_path="/admin/fluxera",
             snapshot_loader=snapshot_loader,
+            readiness_loader=readiness_loader,
         )
 
         status, _headers, body = await _asgi_get(

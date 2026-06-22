@@ -7,11 +7,13 @@ import subprocess
 import sys
 import threading
 import unittest
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import orjson
 import redis as sync_redis
 import redis.asyncio as redis_async
+from redis.exceptions import ResponseError
 
 import fluxera
 
@@ -84,6 +86,76 @@ async def _run_worker_once(redis_url: str, namespace: str, *, send_initial: bool
 
 def _worker_process_entry(redis_url: str, namespace: str, send_initial: bool) -> None:
     asyncio.run(_run_worker_once(redis_url, namespace, send_initial=send_initial))
+
+
+class RedisBrokerGroupCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_pool_options_are_explicit(self) -> None:
+        broker = fluxera.RedisBroker(
+            "redis://127.0.0.1:6379/15",
+            socket_connect_timeout=1.25,
+            socket_timeout=6.0,
+            socket_keepalive=True,
+            health_check_interval=11,
+            max_connections=7,
+            connection_pool_timeout=0.25,
+            client_name="fluxera-unit",
+            promote_due_interval_seconds=0.5,
+            stale_claim_interval_seconds=0.75,
+        )
+        self.addAsyncCleanup(broker.close)
+
+        self.assertEqual(broker.client.connection_pool.max_connections, 7)
+        self.assertEqual(broker.client.connection_pool.timeout, 0.25)
+        self.assertEqual(broker.sync_client.connection_pool.max_connections, 7)
+        self.assertEqual(broker.sync_client.connection_pool.timeout, 0.25)
+
+        async_kwargs = broker.client.connection_pool.connection_kwargs
+        sync_kwargs = broker.sync_client.connection_pool.connection_kwargs
+        self.assertEqual(async_kwargs["socket_connect_timeout"], 1.25)
+        self.assertEqual(async_kwargs["socket_timeout"], 6.0)
+        self.assertTrue(async_kwargs["socket_keepalive"])
+        self.assertEqual(async_kwargs["health_check_interval"], 11)
+        self.assertEqual(async_kwargs["client_name"], "fluxera-unit:async")
+        self.assertEqual(sync_kwargs["client_name"], "fluxera-unit:sync")
+        self.assertEqual(broker.promote_due_interval_seconds, 0.5)
+        self.assertEqual(broker.stale_claim_interval_seconds, 0.75)
+
+    async def test_ensure_group_caches_successful_creation(self) -> None:
+        broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15")
+        self.addAsyncCleanup(broker.close)
+        create = AsyncMock()
+        broker.client.xgroup_create = create
+
+        await broker._ensure_group("default")
+        await broker._ensure_group("default")
+
+        self.assertEqual(create.await_count, 1)
+        self.assertEqual(broker._ensured_groups, {"default"})
+
+    async def test_ensure_group_caches_existing_group(self) -> None:
+        broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15")
+        self.addAsyncCleanup(broker.close)
+        create = AsyncMock(
+            side_effect=ResponseError("BUSYGROUP Consumer Group name already exists")
+        )
+        broker.client.xgroup_create = create
+
+        await broker._ensure_group("default")
+        await broker._ensure_group("default")
+
+        self.assertEqual(create.await_count, 1)
+        self.assertEqual(broker._ensured_groups, {"default"})
+
+    async def test_ensure_group_force_rechecks_redis(self) -> None:
+        broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15")
+        self.addAsyncCleanup(broker.close)
+        create = AsyncMock()
+        broker.client.xgroup_create = create
+
+        await broker._ensure_group("default")
+        await broker._ensure_group("default", force=True)
+
+        self.assertEqual(create.await_count, 2)
 
 
 class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -228,6 +300,23 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await broker.join(remember.queue_name)
 
         self.assertIsNone(await self.redis.get(dedupe_key))
+        await consumer.close()
+
+    async def test_consumer_recreates_missing_group_after_stream_deleted(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, queue_name="default")
+        async def remember(value: str) -> None:
+            del value
+
+        consumer = await broker.open_consumer(remember.queue_name)
+        await broker.client.delete(broker._stream_key(remember.queue_name))
+        await remember.send("alpha")
+
+        delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+
+        self.assertEqual(delivery.args, ("alpha",))
+        await consumer.ack(delivery)
         await consumer.close()
 
     async def test_debounce_replaces_delayed_message_payload(self) -> None:
