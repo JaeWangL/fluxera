@@ -528,7 +528,7 @@ These cover:
 
 ## Current Limits
 
-`0.2.4` is an early alpha, so a few edges are still intentionally narrow:
+`0.2.5` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet
