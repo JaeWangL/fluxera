@@ -1,16 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import html
+import time
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import parse_qs
 
 import orjson
 
-from .admin import get_runtime_status, runtime_status_to_dict
+from .admin import get_redis_readiness, get_runtime_status, runtime_status_to_dict
 
 Headers = list[tuple[bytes, bytes]]
 SnapshotLoader = Callable[[dict[str, list[str]]], Awaitable[dict[str, Any]]]
+ReadinessLoader = Callable[[], Awaitable[dict[str, Any]]]
+DEFAULT_SNAPSHOT_TIMEOUT_SECONDS = 23.0
+DEFAULT_SNAPSHOT_CACHE_SECONDS = 25.0
+DEFAULT_READINESS_TIMEOUT_SECONDS = 2.0
+
+
+@dataclass(slots=True)
+class _SnapshotCacheEntry:
+    payload: dict[str, Any]
+    cached_at_monotonic: float
+    cached_at_ms: int
 
 
 def _normalize_mount_path(path: Optional[str]) -> Optional[str]:
@@ -226,6 +240,10 @@ class FluxeraAdminASGI:
         pending_idle_threshold_ms: Optional[int] = None,
         refresh_seconds: float = 3.0,
         snapshot_loader: Optional[SnapshotLoader] = None,
+        readiness_loader: Optional[ReadinessLoader] = None,
+        snapshot_timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+        snapshot_cache_seconds: float = DEFAULT_SNAPSHOT_CACHE_SECONDS,
+        readiness_timeout_seconds: float = DEFAULT_READINESS_TIMEOUT_SECONDS,
         mount_path: Optional[str] = None,
     ) -> None:
         self.redis_url = redis_url
@@ -235,9 +253,52 @@ class FluxeraAdminASGI:
         self.pending_idle_threshold_ms = pending_idle_threshold_ms
         self.refresh_seconds = refresh_seconds
         self.snapshot_loader = snapshot_loader
+        self.readiness_loader = readiness_loader
+        self.snapshot_timeout_seconds = max(float(snapshot_timeout_seconds), 0.001)
+        self.snapshot_cache_seconds = max(float(snapshot_cache_seconds), 0.0)
+        self.readiness_timeout_seconds = max(float(readiness_timeout_seconds), 0.001)
         self.mount_path = _normalize_mount_path(mount_path)
+        self._snapshot_cache: dict[
+            tuple[tuple[str, tuple[str, ...]], ...],
+            _SnapshotCacheEntry,
+        ] = {}
+        self._snapshot_cache_lock = asyncio.Lock()
 
-    async def _runtime_payload(self, query_params: dict[str, list[str]]) -> dict[str, Any]:
+    def _snapshot_cache_key(
+        self,
+        query_params: dict[str, list[str]],
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return tuple(
+            (key, tuple(values))
+            for key, values in sorted(query_params.items())
+        )
+
+    def _snapshot_cache_fresh(self, entry: Optional[_SnapshotCacheEntry], now: float) -> bool:
+        return (
+            entry is not None
+            and self.snapshot_cache_seconds > 0
+            and now - entry.cached_at_monotonic <= self.snapshot_cache_seconds
+        )
+
+    def _snapshot_payload_from_cache(
+        self,
+        entry: _SnapshotCacheEntry,
+        *,
+        state: str,
+        error_type: Optional[str] = None,
+    ) -> dict[str, Any]:
+        payload = dict(entry.payload)
+        metadata: dict[str, Any] = {
+            "state": state,
+            "cached_at_ms": entry.cached_at_ms,
+            "ttl_seconds": self.snapshot_cache_seconds,
+        }
+        if error_type is not None:
+            metadata["refresh_error_type"] = error_type
+        payload["snapshot_cache"] = metadata
+        return payload
+
+    async def _runtime_payload_uncached(self, query_params: dict[str, list[str]]) -> dict[str, Any]:
         if self.snapshot_loader is not None:
             return await self.snapshot_loader(query_params)
 
@@ -252,6 +313,86 @@ class FluxeraAdminASGI:
         payload = runtime_status_to_dict(status)
         payload["healthy"] = status.overall_status == "ok"
         return payload
+
+    async def _runtime_payload(self, query_params: dict[str, list[str]]) -> dict[str, Any]:
+        key = self._snapshot_cache_key(query_params)
+        now = time.monotonic()
+        entry = self._snapshot_cache.get(key)
+        if self._snapshot_cache_fresh(entry, now):
+            return self._snapshot_payload_from_cache(entry, state="hit")
+
+        async with self._snapshot_cache_lock:
+            now = time.monotonic()
+            entry = self._snapshot_cache.get(key)
+            if self._snapshot_cache_fresh(entry, now):
+                return self._snapshot_payload_from_cache(entry, state="hit")
+
+            try:
+                payload = await asyncio.wait_for(
+                    self._runtime_payload_uncached(query_params),
+                    timeout=self.snapshot_timeout_seconds,
+                )
+            except Exception as exc:
+                entry = self._snapshot_cache.get(key)
+                if self._snapshot_cache_fresh(entry, time.monotonic()):
+                    return self._snapshot_payload_from_cache(
+                        entry,
+                        state="fallback",
+                        error_type=type(exc).__name__,
+                    )
+                raise
+
+            cached_at_ms = int(time.time() * 1000)
+            self._snapshot_cache[key] = _SnapshotCacheEntry(
+                payload=payload,
+                cached_at_monotonic=time.monotonic(),
+                cached_at_ms=cached_at_ms,
+            )
+            response_payload = dict(payload)
+            response_payload["snapshot_cache"] = {
+                "state": "refresh",
+                "cached_at_ms": cached_at_ms,
+                "ttl_seconds": self.snapshot_cache_seconds,
+            }
+            return response_payload
+
+    async def _readiness_payload(self) -> dict[str, Any]:
+        if self.readiness_loader is not None:
+            return await asyncio.wait_for(
+                self.readiness_loader(),
+                timeout=self.readiness_timeout_seconds,
+            )
+        return await get_redis_readiness(
+            self.redis_url,
+            namespace=self.namespace,
+            timeout_seconds=self.readiness_timeout_seconds,
+        )
+
+    def _snapshot_error_payload(self, exc: Exception) -> dict[str, Any]:
+        return {
+            "namespace": self.namespace,
+            "generated_at_ms": int(time.time() * 1000),
+            "overall_status": "degraded",
+            "healthy": False,
+            "error": "snapshot_unavailable",
+            "diagnostics": {
+                "summary": ["snapshot_unavailable"],
+                "error_type": type(exc).__name__,
+            },
+        }
+
+    def _readiness_error_payload(self, exc: Exception) -> dict[str, Any]:
+        return {
+            "namespace": self.namespace,
+            "generated_at_ms": int(time.time() * 1000),
+            "status": "redis_unreachable",
+            "healthy": False,
+            "redis": {
+                "ping": False,
+                "latency_ms": None,
+                "error_type": type(exc).__name__,
+            },
+        }
 
     async def _send(
         self,
@@ -311,26 +452,26 @@ class FluxeraAdminASGI:
             return
 
         if path == "/snapshot":
-            payload = await self._runtime_payload(query_params)
+            status_code = HTTPStatus.OK
+            try:
+                payload = await self._runtime_payload(query_params)
+            except Exception as exc:
+                payload = self._snapshot_error_payload(exc)
+                status_code = HTTPStatus.SERVICE_UNAVAILABLE
             body = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
             await self._send(
                 send,
-                status_code=HTTPStatus.OK,
+                status_code=status_code,
                 content_type="application/json",
                 body=body,
             )
             return
 
         if path in {"/health", "/healthz"}:
-            payload = await self._runtime_payload(query_params)
-            health_payload = {
-                "namespace": payload.get("namespace"),
-                "status": payload.get("overall_status", "unknown"),
-                "healthy": bool(payload.get("healthy")),
-                "generated_at_ms": payload.get("generated_at_ms"),
-                "totals": payload.get("totals", {}),
-                "diagnostics": payload.get("diagnostics", {}),
-            }
+            try:
+                health_payload = await self._readiness_payload()
+            except Exception as exc:
+                health_payload = self._readiness_error_payload(exc)
             body = orjson.dumps(health_payload, option=orjson.OPT_SORT_KEYS)
             await self._send(
                 send,
@@ -356,6 +497,9 @@ def create_admin_asgi_app(
     worker_stale_after_ms: Optional[int] = None,
     pending_idle_threshold_ms: Optional[int] = None,
     refresh_seconds: float = 3.0,
+    snapshot_timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+    snapshot_cache_seconds: float = DEFAULT_SNAPSHOT_CACHE_SECONDS,
+    readiness_timeout_seconds: float = DEFAULT_READINESS_TIMEOUT_SECONDS,
     mount_path: Optional[str] = None,
 ) -> FluxeraAdminASGI:
     return FluxeraAdminASGI(
@@ -365,6 +509,9 @@ def create_admin_asgi_app(
         worker_stale_after_ms=worker_stale_after_ms,
         pending_idle_threshold_ms=pending_idle_threshold_ms,
         refresh_seconds=refresh_seconds,
+        snapshot_timeout_seconds=snapshot_timeout_seconds,
+        snapshot_cache_seconds=snapshot_cache_seconds,
+        readiness_timeout_seconds=readiness_timeout_seconds,
         mount_path=mount_path,
     )
 
@@ -379,6 +526,9 @@ def mount_admin_asgi(
     worker_stale_after_ms: Optional[int] = None,
     pending_idle_threshold_ms: Optional[int] = None,
     refresh_seconds: float = 3.0,
+    snapshot_timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
+    snapshot_cache_seconds: float = DEFAULT_SNAPSHOT_CACHE_SECONDS,
+    readiness_timeout_seconds: float = DEFAULT_READINESS_TIMEOUT_SECONDS,
 ) -> FluxeraAdminASGI:
     mount = getattr(app, "mount", None)
     if not callable(mount):
@@ -391,6 +541,9 @@ def mount_admin_asgi(
         worker_stale_after_ms=worker_stale_after_ms,
         pending_idle_threshold_ms=pending_idle_threshold_ms,
         refresh_seconds=refresh_seconds,
+        snapshot_timeout_seconds=snapshot_timeout_seconds,
+        snapshot_cache_seconds=snapshot_cache_seconds,
+        readiness_timeout_seconds=readiness_timeout_seconds,
         mount_path=mount_path,
     )
     mount(mount_path, admin_app)

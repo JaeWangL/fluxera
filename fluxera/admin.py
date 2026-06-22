@@ -8,6 +8,8 @@ from typing import Any, Optional
 from .brokers.redis import RedisBroker
 from .dead_letters import DeadLetterRecord
 
+DEFAULT_REDIS_READINESS_TIMEOUT_SECONDS = 2.0
+
 
 @dataclass(slots=True)
 class ServingRevisionStatus:
@@ -970,6 +972,53 @@ async def get_runtime_status(
         )
     finally:
         await broker.close()
+
+
+async def get_redis_readiness(
+    redis_url: str,
+    *,
+    namespace: str,
+    timeout_seconds: float = DEFAULT_REDIS_READINESS_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    timeout = max(float(timeout_seconds), 0.001)
+    started = time.monotonic()
+    broker = RedisBroker(
+        redis_url,
+        namespace=namespace,
+        max_connections=4,
+        connection_pool_timeout=min(timeout, 1.0),
+        socket_connect_timeout=min(timeout, 2.0),
+        socket_timeout=timeout,
+        client_name=f"fluxera-admin-readiness:{namespace}",
+    )
+    error_type: Optional[str] = None
+    healthy = False
+    try:
+        healthy = bool(await asyncio.wait_for(broker.client.ping(), timeout=timeout))
+    except Exception as exc:  # noqa: BLE001 - readiness should report failures as data.
+        error_type = type(exc).__name__
+    finally:
+        try:
+            await broker.close()
+        except Exception:
+            if healthy:
+                error_type = "RedisCloseError"
+                healthy = False
+
+    redis_payload: dict[str, Any] = {
+        "ping": healthy,
+        "latency_ms": round((time.monotonic() - started) * 1000, 3),
+    }
+    if error_type is not None:
+        redis_payload["error_type"] = error_type
+
+    return {
+        "namespace": namespace,
+        "generated_at_ms": int(time.time() * 1000),
+        "status": "ok" if healthy else "redis_unreachable",
+        "healthy": healthy,
+        "redis": redis_payload,
+    }
 
 
 async def get_runtime_health(

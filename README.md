@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.2.3` is the current public alpha.
+`0.2.4` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -87,6 +87,32 @@ fluxera worker \
 ```
 
 For smoke tests and one-shot local runs, add `--exit-when-idle`.
+
+## Worker Intake Pressure
+
+Fluxera keeps queue-level consumer tasks for clear rollout, restart, and reclaim
+boundaries, but it bounds the Redis pressure they can create while idle:
+
+- `Worker(max_concurrent_consumer_receives=16)` limits concurrent Redis receive calls
+- `Worker(consumer_idle_backoff_max=1.0)` backs off empty queues before polling again
+- `RedisBroker(promote_due_interval_seconds=0.25)` avoids promoting delayed jobs on every idle poll
+- `RedisBroker(stale_claim_interval_seconds=...)` defaults to a lease-aware interval for pending reclaim
+
+You can tune the worker defaults without code changes:
+
+```bash
+FLUXERA_MAX_CONCURRENT_CONSUMER_RECEIVES=16
+FLUXERA_CONSUMER_IDLE_BACKOFF_MAX_SECONDS=1.0
+FLUXERA_CONSUMER_IDLE_BACKOFF_MULTIPLIER=2.0
+```
+
+To reproduce idle pressure from many queues against a local Redis:
+
+```bash
+python3 benchmarks/redis_idle_consumer_pressure.py \
+  --redis-url redis://127.0.0.1:6379/15 \
+  --queues 58
+```
 
 ## Producer APIs
 
@@ -222,8 +248,12 @@ fluxera monitor serve \
 Dashboard endpoints:
 
 - `/admin`: auto-refreshing queue/worker dashboard
-- `/admin/snapshot`: full runtime JSON payload
-- `/healthz`: health check for probes and deployment gates
+- `/admin/snapshot`: full runtime JSON payload, bounded by a short timeout and backed by a last-good cache
+- `/healthz`: lightweight Redis readiness ping, not a full queue/worker snapshot
+
+Use your application's own liveness endpoint for "server up/down" monitoring.
+Treat `/admin/snapshot` failures as Fluxera/Redis degradation signals instead
+of process liveness failures.
 
 The runtime snapshot includes:
 

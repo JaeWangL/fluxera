@@ -136,6 +136,45 @@ class _RedeliverOnceStubBroker(fluxera.StubBroker):
         return _RedeliverOnceConsumer(base)
 
 
+class _SlowEmptyConsumer(fluxera.Consumer):
+    def __init__(self, broker: "_SlowReceiveStubBroker", queue_name: str) -> None:
+        self._broker = broker
+        self._queue_name = queue_name
+
+    async def receive(self, *, limit: int, timeout: float | None) -> list[fluxera.Delivery]:
+        del limit
+        self._broker.active_receives += 1
+        self._broker.max_active_receives = max(
+            self._broker.max_active_receives,
+            self._broker.active_receives,
+        )
+        self._broker.receive_calls[self._queue_name] += 1
+        try:
+            await asyncio.sleep(timeout or 0.01)
+            return []
+        finally:
+            self._broker.active_receives -= 1
+
+    async def ack(self, delivery: fluxera.Delivery) -> None:
+        del delivery
+
+    async def reject(self, delivery: fluxera.Delivery, *, requeue: bool = False) -> None:
+        del delivery, requeue
+
+
+class _SlowReceiveStubBroker(fluxera.StubBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_receives = 0
+        self.max_active_receives = 0
+        self.receive_calls: defaultdict[str, int] = defaultdict(int)
+
+    async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> fluxera.Consumer:
+        del prefetch
+        self.declare_queue(queue_name)
+        return _SlowEmptyConsumer(self, queue_name)
+
+
 class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_current_worker_state_is_none_outside_actor(self) -> None:
         self.assertIsNone(fluxera.get_current_worker_state())
@@ -798,6 +837,32 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(broker.receive_failures[restart_task.queue_name], 1)
         self.assertEqual(processed, [9])
+
+    async def test_consumer_receive_concurrency_is_bounded(self) -> None:
+        broker = _SlowReceiveStubBroker()
+        queue_names = {f"idle-{index}" for index in range(8)}
+        for queue_name in queue_names:
+            broker.declare_queue(queue_name)
+
+        worker = fluxera.Worker(
+            broker,
+            queues=queue_names,
+            concurrency=4,
+            thread_concurrency=0,
+            process_concurrency=0,
+            prefetch=1,
+            poll_timeout=0.01,
+            consumer_idle_backoff_max=0,
+            max_concurrent_consumer_receives=2,
+        )
+        await worker.start()
+        try:
+            await wait_for_async(lambda: sum(broker.receive_calls.values()) >= 4, timeout=2.0)
+            await asyncio.sleep(0.05)
+        finally:
+            await worker.stop()
+
+        self.assertLessEqual(broker.max_active_receives, 2)
 
     async def test_revision_heartbeat_failure_is_logged_and_retried(self) -> None:
         broker = _FlakyRevisionStubBroker(fail_on_register_call=2)
