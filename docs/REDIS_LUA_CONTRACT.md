@@ -2,7 +2,7 @@
 
 Status: Draft v0.1
 
-Last Updated: 2026-03-28
+Last Updated: 2026-07-20
 
 ## 1. Scope
 
@@ -10,6 +10,8 @@ This document defines the first draft of Redis Lua contracts for:
 
 - enqueue-time deduplication
 - delayed-message replacement
+- queue-registry maintenance
+- terminal delivery acknowledgement and payload cleanup
 - idempotency acquisition
 - lease heartbeat
 - success commit
@@ -26,6 +28,8 @@ Fluxera should use a message registry model for Redis-backed dedupe and idempote
 - `namespace:stream:{queue}` -> stream of `message_id`
 - `namespace:delayed:{queue}` -> zset of `message_id` scored by due timestamp
 - `namespace:message:{message_id}` -> encoded message payload
+- `namespace:message_ref:{message_id}` -> number of live transport entries for the payload
+- `namespace:registry:queues` -> set of queues known to runtime discovery
 - `namespace:dead:{queue}` -> dead-letter list
 
 ### 2.2 Dedupe Keys
@@ -70,7 +74,7 @@ Suggested fields:
 - return values are machine-readable tuples, not ad hoc strings
 - ownership-sensitive scripts require both `owner` and `fence`
 - scripts never delete a key unless the caller proves ownership or the stored lease is stale
-- dedupe and idempotency scripts are transport-independent; broker ack remains outside these scripts
+- ownership-sensitive dedupe and idempotency transitions remain separate from transport ACK
 
 ## 4. Contract: `enqueue_or_deduplicate.lua`
 
@@ -85,10 +89,12 @@ Atomically decide whether to:
 
 ### Required Keys
 
-1. `message_key`
+1. `message_key_prefix`
 2. `stream_key`
 3. `delayed_key`
 4. `dedupe_key`
+5. `queue_registry_key`
+6. `message_ref_key_prefix`
 
 ### Required Args
 
@@ -100,6 +106,8 @@ Atomically decide whether to:
 6. `ttl_ms`
 7. `extend` (`0` or `1`)
 8. `replace` (`0` or `1`)
+9. `message_ttl_ms`
+10. `queue_name`
 
 ### Return Contract
 
@@ -115,7 +123,8 @@ Atomically decide whether to:
 
 #### `mode = none`
 
-- write `message_key`
+- add `queue_name` to `queue_registry_key`
+- write `message_key` and increment `message_ref`
 - if `deliver_at_ms <= now_ms`, append `message_id` to `stream`
 - otherwise add `message_id` to `delayed`
 
@@ -123,13 +132,13 @@ Atomically decide whether to:
 
 - if `dedupe_key` exists, return `deduplicated`
 - otherwise set `dedupe_key = message_id`
-- write `message_key`
+- write `message_key` and increment `message_ref`
 - enqueue or schedule the message
 
 #### `mode = throttle`
 
 - if `SET dedupe_key message_id NX PX ttl_ms` fails, return `deduplicated`
-- otherwise write `message_key` and enqueue or schedule
+- otherwise write `message_key`, increment `message_ref`, and enqueue or schedule
 
 #### `mode = debounce`
 
@@ -138,10 +147,29 @@ Rules:
 - must be used with delayed delivery
 - `replace` must be true
 - if `dedupe_key` does not exist, set it to `message_id` with TTL and schedule new delayed message
-- if `dedupe_key` points to an existing delayed owner, remove the old `message_id` from `delayed`, delete its `message_key`, store the new message, update the key, and return `replaced`
+- if `dedupe_key` points to an existing delayed owner, remove the old `message_id` from `delayed`, release its payload reference, store the new message, update the key, and return `replaced`
 - if the dedupe key exists but the pointed message is not in `delayed`, treat it as stale and overwrite it with the new delayed owner
 - if `extend` is true, refresh TTL on every replacement
 - if `extend` is false, preserve remaining TTL
+
+When replacing a delayed owner, decrement its payload reference and delete the
+payload only when no transport reference remains. If a pre-reference-count
+payload is encountered during a rolling upgrade, initialize one legacy
+reference before adding the new one.
+
+### Related Contract: `acknowledge_delivery.lua`
+
+The acknowledgement script receives the stream key, payload key, and payload
+reference key plus consumer group and transport ID. It atomically:
+
+1. runs `XACK`
+2. runs `XDEL`
+3. decrements the payload reference only when the stream entry was deleted
+4. deletes payload and reference keys when the count reaches zero
+
+Repeating the same ACK is safe because a second `XDEL` returns zero and does not
+decrement the reference again. Retry and requeue paths enqueue the next
+reference before acknowledging the previous transport entry.
 
 ## 5. Contract: `remove_dedupe_key_if_owner.lua`
 

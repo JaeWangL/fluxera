@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.2.5` is the current public alpha.
+`0.3.0` is the current public alpha.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -83,7 +83,8 @@ fluxera worker \
   --broker your_project.fluxera_setup:broker \
   --uvloop \
   --concurrency 64 \
-  --thread-concurrency 8
+  --thread-concurrency 8 \
+  --worker-presence-interval 5
 ```
 
 For smoke tests and one-shot local runs, add `--exit-when-idle`.
@@ -95,8 +96,16 @@ boundaries, but it bounds the Redis pressure they can create while idle:
 
 - `Worker(max_concurrent_consumer_receives=16)` limits concurrent Redis receive calls
 - `Worker(consumer_idle_backoff_max=1.0)` backs off empty queues before polling again
+- `Worker(worker_presence_interval=5.0)` keeps fast revision reads while publishing presence less often
 - `RedisBroker(promote_due_interval_seconds=0.25)` avoids promoting delayed jobs on every idle poll
 - `RedisBroker(stale_claim_interval_seconds=...)` defaults to a lease-aware interval for pending reclaim
+- `RedisBroker` batches concurrent lease extensions with `XCLAIM JUSTID`
+- `RedisBroker.join()` backs off unchanged queue-state polling from `0.1s` to `0.5s`
+
+Serving revisions are read for all managed queues with one `MGET` per poll.
+Presence is still published immediately when a queue changes between `accepting`
+and `draining`, and its interval is capped at one third of the broker presence
+TTL.
 
 You can tune the worker defaults without code changes:
 
@@ -104,6 +113,7 @@ You can tune the worker defaults without code changes:
 FLUXERA_MAX_CONCURRENT_CONSUMER_RECEIVES=16
 FLUXERA_CONSUMER_IDLE_BACKOFF_MAX_SECONDS=1.0
 FLUXERA_CONSUMER_IDLE_BACKOFF_MULTIPLIER=2.0
+FLUXERA_WORKER_PRESENCE_INTERVAL_SECONDS=5.0
 ```
 
 To reproduce idle pressure from many queues against a local Redis:
@@ -242,14 +252,20 @@ fluxera monitor serve \
   --redis-url redis://127.0.0.1:6379/15 \
   --namespace hello-fluxera \
   --host 0.0.0.0 \
-  --port 8090
+  --port 8090 \
+  --snapshot-cache-seconds 25
 ```
 
 Dashboard endpoints:
 
 - `/admin`: auto-refreshing queue/worker dashboard
-- `/admin/snapshot`: full runtime JSON payload, bounded by a short timeout and backed by a last-good cache
+- `/admin/snapshot`: full runtime JSON payload backed by a recent-success cache
 - `/healthz`: lightweight Redis readiness ping, not a full queue/worker snapshot
+
+Long-lived admin servers reuse a small dedicated Redis readiness pool instead
+of opening a connection for every probe. Runtime snapshots are cached by queue
+filter; set the cache duration to `0` only when every request must force a fresh
+Redis snapshot. The ASGI admin also applies a bounded refresh timeout.
 
 Use your application's own liveness endpoint for "server up/down" monitoring.
 Treat `/admin/snapshot` failures as Fluxera/Redis degradation signals instead
@@ -292,6 +308,26 @@ Mounted endpoints become:
 - Deduplication is an enqueue-time admission policy, not exactly-once execution.
 - Effectively-once side effects require idempotency keys or application-level dedupe.
 - Redis workers renew leases for long-running tasks and reclaim stale pending deliveries.
+- A terminal Redis ACK removes the stream entry and releases its payload reference atomically.
+
+## Redis Registry And Cleanup
+
+Redis queue discovery uses `namespace:registry:queues`. Enqueue, serving-revision,
+and worker-presence writes all refresh the registry, so deleting the set is
+self-healing while current writers are active.
+
+`RedisBroker` defaults to `runtime_queue_discovery_mode="auto"`. It scans and
+backfills legacy queue keys during a `300s` migration grace period, then reads
+the registry directly. For a mixed-version rollout that can exceed that window,
+keep operational discovery on `runtime_queue_discovery_mode="dual"` until all
+old writers are gone. `reconcile_runtime_queue_registry(remove_stale=True)` can
+remove entries only after an atomic recheck confirms that no runtime key exists.
+
+Payloads use `namespace:message:{message_id}` plus a
+`namespace:message_ref:{message_id}` reference counter. Success, terminal
+failure, and integrity dead-letter paths release references atomically; retry
+and requeue preserve the next attempt. Payloads orphaned by administrative
+flushes or an interrupted producer still rely on `message_ttl_seconds`.
 
 ## Retry And Callbacks
 
@@ -505,4 +541,4 @@ The current release candidate was checked with:
 
 - public APIs may still change during the alpha period
 - result backends are not implemented yet
-- message registry garbage collection is still intentionally simple
+- abnormal or administratively removed message payloads still rely on registry TTL cleanup

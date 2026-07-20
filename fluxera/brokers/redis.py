@@ -27,6 +27,14 @@ DEFAULT_REDIS_CONNECTION_POOL_TIMEOUT_SECONDS = 2.0
 DEFAULT_REDIS_PROMOTE_DUE_INTERVAL_SECONDS = 0.25
 DEFAULT_REDIS_STALE_CLAIM_INTERVAL_MAX_SECONDS = 5.0
 DEFAULT_REDIS_STALE_CLAIM_INTERVAL_MIN_SECONDS = 0.1
+DEFAULT_REDIS_JOIN_POLL_INTERVAL_SECONDS = 0.1
+DEFAULT_REDIS_JOIN_POLL_INTERVAL_MAX_SECONDS = 0.5
+DEFAULT_REDIS_JOIN_POLL_INTERVAL_MULTIPLIER = 2.0
+DEFAULT_REDIS_LEASE_EXTENSION_BATCH_SIZE = 256
+DEFAULT_REDIS_LEASE_EXTENSION_BATCH_WINDOW_SECONDS = 0.001
+DEFAULT_REDIS_QUEUE_DISCOVERY_MODE = "auto"
+DEFAULT_REDIS_QUEUE_REGISTRY_MIGRATION_GRACE_SECONDS = 300.0
+DEFAULT_REDIS_RUNTIME_QUEUE_BATCH_SIZE = 100
 
 
 def _normalize_error_message(exc: ResponseError) -> str:
@@ -81,6 +89,14 @@ class RedisBroker(Broker):
         client_name: Optional[str] = None,
         promote_due_interval_seconds: float = DEFAULT_REDIS_PROMOTE_DUE_INTERVAL_SECONDS,
         stale_claim_interval_seconds: Optional[float] = None,
+        join_poll_interval_seconds: float = DEFAULT_REDIS_JOIN_POLL_INTERVAL_SECONDS,
+        join_poll_interval_max_seconds: float = DEFAULT_REDIS_JOIN_POLL_INTERVAL_MAX_SECONDS,
+        join_poll_interval_multiplier: float = DEFAULT_REDIS_JOIN_POLL_INTERVAL_MULTIPLIER,
+        lease_extension_batch_size: int = DEFAULT_REDIS_LEASE_EXTENSION_BATCH_SIZE,
+        lease_extension_batch_window_seconds: float = DEFAULT_REDIS_LEASE_EXTENSION_BATCH_WINDOW_SECONDS,
+        runtime_queue_discovery_mode: str = DEFAULT_REDIS_QUEUE_DISCOVERY_MODE,
+        queue_registry_migration_grace_seconds: float = DEFAULT_REDIS_QUEUE_REGISTRY_MIGRATION_GRACE_SECONDS,
+        runtime_queue_batch_size: int = DEFAULT_REDIS_RUNTIME_QUEUE_BATCH_SIZE,
         encoder: Optional[MessageEncoder] = None,
     ) -> None:
         super().__init__()
@@ -100,6 +116,33 @@ class RedisBroker(Broker):
             if stale_claim_interval_seconds is None
             else max(float(stale_claim_interval_seconds), 0.0)
         )
+        self.join_poll_interval_seconds = max(float(join_poll_interval_seconds), 0.001)
+        self.join_poll_interval_max_seconds = max(
+            float(join_poll_interval_max_seconds),
+            self.join_poll_interval_seconds,
+        )
+        self.join_poll_interval_multiplier = max(float(join_poll_interval_multiplier), 1.0)
+        self.lease_extension_batch_size = max(int(lease_extension_batch_size), 1)
+        self.lease_extension_batch_window_seconds = max(
+            float(lease_extension_batch_window_seconds),
+            0.0,
+        )
+        self.runtime_queue_discovery_mode = str(runtime_queue_discovery_mode).lower()
+        if self.runtime_queue_discovery_mode not in {
+            "auto",
+            "dual",
+            "registry",
+            "scan",
+        }:
+            raise ValueError(
+                "runtime_queue_discovery_mode must be one of "
+                "'auto', 'dual', 'registry', or 'scan'."
+            )
+        self.queue_registry_migration_grace_seconds = max(
+            float(queue_registry_migration_grace_seconds),
+            0.0,
+        )
+        self.runtime_queue_batch_size = max(int(runtime_queue_batch_size), 1)
         self.encoder = encoder or JSONMessageEncoder()
         self.socket_connect_timeout = (
             None
@@ -142,6 +185,7 @@ class RedisBroker(Broker):
         self.scripts = RedisLuaScripts(self.client)
         self.sync_scripts = RedisLuaScripts(self.sync_client)
         self._ensured_groups: set[str] = set()
+        self._registered_runtime_queues: set[str] = set()
 
     @property
     def message_ttl_ms(self) -> int:
@@ -166,6 +210,12 @@ class RedisBroker(Broker):
     def _workers_key(self, queue_name: str) -> str:
         return f"{self.namespace}:workers:{queue_name}"
 
+    def _queue_registry_key(self) -> str:
+        return f"{self.namespace}:registry:queues"
+
+    def _queue_registry_migrated_at_key(self) -> str:
+        return f"{self.namespace}:registry:queues:migrated_at_ms"
+
     def _delayed_key(self, queue_name: str) -> str:
         return f"{self.namespace}:delayed:{queue_name}"
 
@@ -180,6 +230,12 @@ class RedisBroker(Broker):
 
     def _message_key(self, message_id: str) -> str:
         return f"{self._message_key_prefix()}{message_id}"
+
+    def _message_ref_key_prefix(self) -> str:
+        return f"{self.namespace}:message_ref:"
+
+    def _message_ref_key(self, message_id: str) -> str:
+        return f"{self._message_ref_key_prefix()}{message_id}"
 
     def _dedupe_key(self, queue_name: str, actor_name: str, dedupe_id: str) -> str:
         return f"{self.namespace}:dedupe:{queue_name}:{actor_name}:{dedupe_id}"
@@ -356,7 +412,19 @@ class RedisBroker(Broker):
             return
 
         await self._create_group(queue_name)
+        await self._register_runtime_queue(queue_name, force=True)
         self._ensured_groups.add(queue_name)
+
+    async def _register_runtime_queue(
+        self,
+        queue_name: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        if not force and queue_name in self._registered_runtime_queues:
+            return
+        await self.client.sadd(self._queue_registry_key(), queue_name)
+        self._registered_runtime_queues.add(queue_name)
 
     async def _create_group(self, queue_name: str) -> None:
         stream_key = self._stream_key(queue_name)
@@ -368,8 +436,12 @@ class RedisBroker(Broker):
 
     async def ensure_serving_revision(self, queue_name: str, worker_revision: str) -> str:
         key = self._serving_revision_key(queue_name)
-        await self.client.setnx(key, worker_revision)
-        current = await self.client.get(key)
+        pipe = self.client.pipeline()
+        pipe.sadd(self._queue_registry_key(), queue_name)
+        pipe.setnx(key, worker_revision)
+        pipe.get(key)
+        _registered, _created, current = await pipe.execute()
+        self._registered_runtime_queues.add(queue_name)
         if current is None:
             await self.client.set(key, worker_revision)
             return worker_revision
@@ -381,6 +453,25 @@ class RedisBroker(Broker):
             return None
         return _decode_message_id(current)
 
+    async def get_serving_revisions(
+        self,
+        queue_names: set[str],
+    ) -> dict[str, Optional[str]]:
+        queue_names_sorted = sorted(queue_names)
+        if not queue_names_sorted:
+            return {}
+
+        values = await self.client.mget(
+            *[
+                self._serving_revision_key(queue_name)
+                for queue_name in queue_names_sorted
+            ]
+        )
+        return {
+            queue_name: None if value is None else _decode_message_id(value)
+            for queue_name, value in zip(queue_names_sorted, values)
+        }
+
     async def promote_serving_revision(
         self,
         queue_name: str,
@@ -390,7 +481,11 @@ class RedisBroker(Broker):
     ) -> bool:
         key = self._serving_revision_key(queue_name)
         if expected_revision is None:
-            await self.client.set(key, revision)
+            pipe = self.client.pipeline()
+            pipe.sadd(self._queue_registry_key(), queue_name)
+            pipe.set(key, revision)
+            await pipe.execute()
+            self._registered_runtime_queues.add(queue_name)
             return True
 
         while True:
@@ -403,8 +498,10 @@ class RedisBroker(Broker):
                     await pipe.reset()
                     return False
                 pipe.multi()
+                pipe.sadd(self._queue_registry_key(), queue_name)
                 pipe.set(key, revision)
                 await pipe.execute()
+                self._registered_runtime_queues.add(queue_name)
                 return True
             except WatchError:
                 continue
@@ -437,6 +534,8 @@ class RedisBroker(Broker):
                     continue
                 mapping[str(key)] = str(value)
         pipe = self.client.pipeline()
+        if queue_states:
+            pipe.sadd(self._queue_registry_key(), *sorted(queue_states))
         pipe.hset(worker_key, mapping=mapping)
         pipe.pexpire(worker_key, self.worker_presence_ttl_ms)
         stale_before = now_ms - self.worker_presence_ttl_ms
@@ -445,6 +544,7 @@ class RedisBroker(Broker):
             pipe.zadd(workers_key, {worker_id: now_ms})
             pipe.zremrangebyscore(workers_key, 0, stale_before)
         await pipe.execute()
+        self._registered_runtime_queues.update(queue_states)
 
     async def unregister_worker_revision(self, *, worker_id: str, queue_names: set[str]) -> None:
         pipe = self.client.pipeline()
@@ -453,8 +553,8 @@ class RedisBroker(Broker):
             pipe.zrem(self._workers_key(queue_name), worker_id)
         await pipe.execute()
 
-    async def list_runtime_queues(self) -> list[str]:
-        queue_names = set(self.queues)
+    async def _scan_runtime_queues(self) -> set[str]:
+        queue_names: set[str] = set()
         scans = (
             (f"{self.namespace}:serving_revision:*", f"{self.namespace}:serving_revision:"),
             (f"{self.namespace}:stream:*", f"{self.namespace}:stream:"),
@@ -471,15 +571,148 @@ class RedisBroker(Broker):
                         continue
                     if queue_name:
                         queue_names.add(queue_name)
-        return sorted(queue_names)
+        return queue_names
+
+    async def _registry_runtime_queues(self) -> set[str]:
+        return {
+            _decode_message_id(queue_name)
+            for queue_name in await self.client.smembers(self._queue_registry_key())
+            if queue_name
+        }
+
+    async def _registry_discovery_state(
+        self,
+    ) -> tuple[set[str], Optional[int]]:
+        pipe = self.client.pipeline(transaction=False)
+        pipe.smembers(self._queue_registry_key())
+        pipe.get(self._queue_registry_migrated_at_key())
+        raw_queues, raw_migrated_at_ms = await pipe.execute()
+        queue_names = {
+            _decode_message_id(queue_name)
+            for queue_name in raw_queues
+            if queue_name
+        }
+        try:
+            migrated_at_ms = (
+                None
+                if raw_migrated_at_ms is None
+                else int(_decode_message_id(raw_migrated_at_ms))
+            )
+        except (TypeError, ValueError):
+            migrated_at_ms = None
+        return queue_names, migrated_at_ms
+
+    async def _backfill_runtime_queue_registry(
+        self,
+        scanned_queues: set[str],
+        registry_queues: set[str],
+        *,
+        mark_migrated: bool,
+    ) -> None:
+        backfilled = scanned_queues - registry_queues
+        pipe = self.client.pipeline()
+        if backfilled:
+            pipe.sadd(self._queue_registry_key(), *sorted(backfilled))
+        if mark_migrated:
+            pipe.setnx(
+                self._queue_registry_migrated_at_key(),
+                int(time.time() * 1000),
+            )
+        if backfilled or mark_migrated:
+            await pipe.execute()
+            self._registered_runtime_queues.update(backfilled)
+
+    async def list_runtime_queues(self) -> list[str]:
+        mode = self.runtime_queue_discovery_mode
+        if mode == "scan":
+            return sorted(set(self.queues) | await self._scan_runtime_queues())
+
+        try:
+            registry_queues, migrated_at_ms = await self._registry_discovery_state()
+        except Exception:
+            return sorted(set(self.queues) | await self._scan_runtime_queues())
+
+        now_ms = int(time.time() * 1000)
+        grace_elapsed = (
+            migrated_at_ms is not None
+            and now_ms - migrated_at_ms
+            >= int(self.queue_registry_migration_grace_seconds * 1000)
+        )
+        if mode == "registry" and registry_queues:
+            return sorted(set(self.queues) | registry_queues)
+        if mode == "auto" and registry_queues and grace_elapsed:
+            return sorted(set(self.queues) | registry_queues)
+
+        scanned_queues = await self._scan_runtime_queues()
+        try:
+            await self._backfill_runtime_queue_registry(
+                scanned_queues,
+                registry_queues,
+                mark_migrated=mode in {"auto", "dual"},
+            )
+        except Exception:
+            pass
+        return sorted(set(self.queues) | scanned_queues | registry_queues)
+
+    async def reconcile_runtime_queue_registry(
+        self,
+        *,
+        remove_stale: bool = False,
+    ) -> dict[str, list[str]]:
+        scanned_queues = await self._scan_runtime_queues()
+        registry_queues = await self._registry_runtime_queues()
+        backfilled = sorted(scanned_queues - registry_queues)
+        if backfilled:
+            await self.client.sadd(self._queue_registry_key(), *backfilled)
+            self._registered_runtime_queues.update(backfilled)
+
+        removed: list[str] = []
+        if remove_stale:
+            stale_candidates = sorted(
+                registry_queues - scanned_queues - set(self.queues)
+            )
+            for queue_name in stale_candidates:
+                runtime_keys = [
+                    self._serving_revision_key(queue_name),
+                    self._stream_key(queue_name),
+                    self._delayed_key(queue_name),
+                    self._workers_key(queue_name),
+                    self._dead_letter_key(queue_name),
+                ]
+                if await self.scripts.remove_stale_queue(
+                    registry_key=self._queue_registry_key(),
+                    queue_name=queue_name,
+                    runtime_keys=runtime_keys,
+                ):
+                    removed.append(queue_name)
+                    self._registered_runtime_queues.discard(queue_name)
+
+        return {
+            "backfilled": backfilled,
+            "removed": removed,
+            "scanned": sorted(scanned_queues),
+            "registered": sorted(
+                (registry_queues | set(backfilled)) - set(removed)
+            ),
+        }
 
     async def list_worker_runtime_rows(self, *, queue_names: Optional[set[str]] = None) -> list[dict[str, str]]:
         worker_ids: set[str] = set()
-        if queue_names:
-            for queue_name in queue_names:
-                members = await self.client.zrange(self._workers_key(queue_name), 0, -1)
-                for raw_member in members:
-                    worker_ids.add(_decode_message_id(raw_member))
+        if queue_names is not None:
+            if not queue_names:
+                return []
+            queue_names_sorted = sorted(queue_names)
+            for offset in range(0, len(queue_names_sorted), self.runtime_queue_batch_size):
+                queue_chunk = queue_names_sorted[
+                    offset : offset + self.runtime_queue_batch_size
+                ]
+                pipe = self.client.pipeline(transaction=False)
+                for queue_name in queue_chunk:
+                    pipe.zrange(self._workers_key(queue_name), 0, -1)
+                memberships = await pipe.execute()
+                for members in memberships:
+                    for raw_member in members:
+                        worker_ids.add(_decode_message_id(raw_member))
         else:
             prefix = f"{self.namespace}:worker:"
             async for raw_key in self.client.scan_iter(match=f"{prefix}*", count=128):
@@ -491,21 +724,25 @@ class RedisBroker(Broker):
             return []
 
         worker_ids_sorted = sorted(worker_id for worker_id in worker_ids if worker_id)
-        pipe = self.client.pipeline()
-        for worker_id in worker_ids_sorted:
-            pipe.hgetall(self._worker_key(worker_id))
-        payloads = await pipe.execute()
-
         rows: list[dict[str, str]] = []
-        for worker_id, payload in zip(worker_ids_sorted, payloads):
-            if not payload:
-                continue
-            decoded = {
-                _decode_message_id(key): _decode_message_id(value)
-                for key, value in payload.items()
-            }
-            decoded["worker_id"] = worker_id
-            rows.append(decoded)
+        for offset in range(0, len(worker_ids_sorted), self.runtime_queue_batch_size):
+            worker_id_chunk = worker_ids_sorted[
+                offset : offset + self.runtime_queue_batch_size
+            ]
+            pipe = self.client.pipeline(transaction=False)
+            for worker_id in worker_id_chunk:
+                pipe.hgetall(self._worker_key(worker_id))
+            payloads = await pipe.execute()
+
+            for worker_id, payload in zip(worker_id_chunk, payloads):
+                if not payload:
+                    continue
+                decoded = {
+                    _decode_message_id(key): _decode_message_id(value)
+                    for key, value in payload.items()
+                }
+                decoded["worker_id"] = worker_id
+                rows.append(decoded)
         return rows
 
     async def get_queue_runtime_row(
@@ -555,6 +792,90 @@ class RedisBroker(Broker):
             "worker_ids": [_decode_message_id(worker_id) for worker_id in worker_members],
         }
 
+    async def get_queue_runtime_rows(
+        self,
+        queue_names: list[str],
+        *,
+        pending_idle_threshold_ms: Optional[int] = None,
+        include_worker_ids: bool = True,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        batch_size = self.runtime_queue_batch_size
+        for offset in range(0, len(queue_names), batch_size):
+            queue_chunk = queue_names[offset : offset + batch_size]
+            pipe = self.client.pipeline(transaction=False)
+            for queue_name in queue_chunk:
+                stream_key = self._stream_key(queue_name)
+                pipe.xlen(stream_key)
+                pipe.zcard(self._delayed_key(queue_name))
+                pipe.get(self._serving_revision_key(queue_name))
+                pipe.xpending(stream_key, self.group_name)
+                if include_worker_ids:
+                    pipe.zrange(self._workers_key(queue_name), 0, -1)
+
+            responses = await pipe.execute(raise_on_error=False)
+            response_offset = 0
+            for queue_name in queue_chunk:
+                stream_length = responses[response_offset]
+                delayed_count = responses[response_offset + 1]
+                serving_revision = responses[response_offset + 2]
+                pending = responses[response_offset + 3]
+                response_offset += 4
+                worker_members = []
+                if include_worker_ids:
+                    worker_members = responses[response_offset]
+                    response_offset += 1
+
+                for response in (
+                    stream_length,
+                    delayed_count,
+                    serving_revision,
+                    worker_members,
+                ):
+                    if isinstance(response, BaseException):
+                        raise response
+
+                pending_count = 0
+                if isinstance(pending, ResponseError):
+                    message = _normalize_error_message(pending)
+                    if "NOGROUP" not in message and "no such key" not in message:
+                        raise pending
+                elif isinstance(pending, BaseException):
+                    raise pending
+                else:
+                    pending_count = int(pending["pending"])
+
+                pending_stale_count = 0
+                if (
+                    pending_idle_threshold_ms is not None
+                    and pending_idle_threshold_ms > 0
+                    and pending_count > 0
+                ):
+                    pending_stale_count = await self._count_pending_with_min_idle(
+                        self._stream_key(queue_name),
+                        min_idle_ms=pending_idle_threshold_ms,
+                    )
+
+                rows.append(
+                    {
+                        "queue_name": queue_name,
+                        "serving_revision": (
+                            None
+                            if serving_revision is None
+                            else _decode_message_id(serving_revision)
+                        ),
+                        "stream_length": int(stream_length),
+                        "delayed_count": int(delayed_count),
+                        "pending_count": pending_count,
+                        "pending_stale_count": pending_stale_count,
+                        "worker_ids": [
+                            _decode_message_id(worker_id)
+                            for worker_id in worker_members
+                        ],
+                    }
+                )
+        return rows
+
     async def _count_pending_with_min_idle(self, stream_key: str, *, min_idle_ms: int) -> int:
         total = 0
         start = "-"
@@ -596,13 +917,47 @@ class RedisBroker(Broker):
         )
 
     async def send(self, message: Message, *, delay: Optional[float] = None) -> Message:
+        return await self._send(
+            message,
+            delay=delay,
+            bypass_deduplication=False,
+        )
+
+    async def send_for_retry(
+        self,
+        message: Message,
+        *,
+        delay: Optional[float] = None,
+    ) -> Message:
+        return await self._send(
+            message,
+            delay=delay,
+            bypass_deduplication=True,
+        )
+
+    async def _send(
+        self,
+        message: Message,
+        *,
+        delay: Optional[float],
+        bypass_deduplication: bool,
+    ) -> Message:
         self.declare_queue(message.queue_name)
         now_ms = int(time.time() * 1000)
         deliver_at_ms = 0
         if delay is not None and delay > 0:
             deliver_at_ms = now_ms + int(delay * 1000)
 
-        mode, dedupe_id, ttl_ms, extend, replace = self._normalize_deduplication(message)
+        if bypass_deduplication:
+            mode, dedupe_id, ttl_ms, extend, replace = (
+                "none",
+                "",
+                0,
+                False,
+                False,
+            )
+        else:
+            mode, dedupe_id, ttl_ms, extend, replace = self._normalize_deduplication(message)
         if mode == "debounce" and deliver_at_ms <= now_ms:
             raise ValueError("Debounce deduplication requires delayed delivery.")
 
@@ -613,9 +968,12 @@ class RedisBroker(Broker):
 
         decision = await self.scripts.enqueue_or_deduplicate(
             message_key_prefix=self._message_key_prefix(),
+            message_ref_key_prefix=self._message_ref_key_prefix(),
             stream_key=self._stream_key(message.queue_name),
             delayed_key=self._delayed_key(message.queue_name),
             dedupe_key=dedupe_key,
+            queue_registry_key=self._queue_registry_key(),
+            queue_name=message.queue_name,
             message_id=message.message_id,
             encoded_message=self._encode_message(message),
             now_ms=now_ms,
@@ -628,6 +986,7 @@ class RedisBroker(Broker):
         )
         if decision.status == "error":
             raise ValueError(f"Redis deduplication rejected message {message.message_id}: {decision.message_id}")
+        self._registered_runtime_queues.add(message.queue_name)
         return message
 
     def send_sync(self, message: Message, *, delay: Optional[float] = None) -> Message:
@@ -648,9 +1007,12 @@ class RedisBroker(Broker):
 
         decision = self.sync_scripts.enqueue_or_deduplicate_sync(
             message_key_prefix=self._message_key_prefix(),
+            message_ref_key_prefix=self._message_ref_key_prefix(),
             stream_key=self._stream_key(message.queue_name),
             delayed_key=self._delayed_key(message.queue_name),
             dedupe_key=dedupe_key,
+            queue_registry_key=self._queue_registry_key(),
+            queue_name=message.queue_name,
             message_id=message.message_id,
             encoded_message=self._encode_message(message),
             now_ms=now_ms,
@@ -663,6 +1025,7 @@ class RedisBroker(Broker):
         )
         if decision.status == "error":
             raise ValueError(f"Redis deduplication rejected message {message.message_id}: {decision.message_id}")
+        self._registered_runtime_queues.add(message.queue_name)
         return message
 
     async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> Consumer:
@@ -778,7 +1141,8 @@ class RedisBroker(Broker):
 
         stream_key = self._stream_key(queue_name)
         delayed_key = self._delayed_key(queue_name)
-        sleep_interval = min(max(self.lease_seconds * 0.1, 0.01), 0.1)
+        sleep_interval = self.join_poll_interval_seconds
+        previous_state: Optional[tuple[int, int, int]] = None
 
         while True:
             await self._promote_due(queue_name)
@@ -788,6 +1152,15 @@ class RedisBroker(Broker):
             if not stream_exists:
                 if delayed_count == 0:
                     return
+                state = (int(delayed_count), 0, 0)
+                if state == previous_state:
+                    sleep_interval = min(
+                        sleep_interval * self.join_poll_interval_multiplier,
+                        self.join_poll_interval_max_seconds,
+                    )
+                else:
+                    sleep_interval = self.join_poll_interval_seconds
+                previous_state = state
                 await asyncio.sleep(sleep_interval)
                 continue
 
@@ -806,6 +1179,15 @@ class RedisBroker(Broker):
             if delayed_count == 0 and stream_length == 0 and pending_count == 0:
                 return
 
+            state = (int(delayed_count), stream_length, pending_count)
+            if state == previous_state:
+                sleep_interval = min(
+                    sleep_interval * self.join_poll_interval_multiplier,
+                    self.join_poll_interval_max_seconds,
+                )
+            else:
+                sleep_interval = self.join_poll_interval_seconds
+            previous_state = state
             await asyncio.sleep(sleep_interval)
 
     async def close(self) -> None:
@@ -857,6 +1239,11 @@ class _RedisConsumer(Consumer):
         self._closed = False
         self._next_promote_due_at = 0.0
         self._next_stale_claim_at = 0.0
+        self._pending_lease_extensions: dict[
+            float,
+            list[tuple[Delivery, asyncio.Future[None]]],
+        ] = {}
+        self._lease_extension_flush_task: Optional[asyncio.Task[None]] = None
 
     @property
     def lease_ms(self) -> int:
@@ -866,6 +1253,12 @@ class _RedisConsumer(Consumer):
         if b"message_id" in fields:
             return _decode_message_id(fields[b"message_id"])
         return _decode_message_id(fields["message_id"])
+
+    def _registry_message_id(self, delivery: Delivery) -> str:
+        message_id = delivery.metadata.get("message_id")
+        if message_id is None:
+            return delivery.message_id
+        return _decode_message_id(message_id)
 
     async def _build_deliveries(self, entries, *, redelivered: bool) -> list[Delivery]:
         if not entries:
@@ -936,6 +1329,7 @@ class _RedisConsumer(Consumer):
                     "lease_seconds": self.broker.lease_seconds,
                     "message_id": message_id,
                     "message_key": self.broker._message_key(message_id),
+                    "message_ref_key": self.broker._message_ref_key(message_id),
                 },
             )
             deliveries.append(delivery)
@@ -949,8 +1343,14 @@ class _RedisConsumer(Consumer):
                 transport_id = record.delivery_id
                 if transport_id is None:
                     continue
-                pipe.xack(self.stream_key, self.broker.group_name, transport_id)
-                pipe.xdel(self.stream_key, transport_id)
+                await self.broker.scripts.acknowledge_delivery(
+                    stream_key=self.stream_key,
+                    payload_key=self.broker._message_key(record.message_id),
+                    payload_ref_key=self.broker._message_ref_key(record.message_id),
+                    group_name=self.broker.group_name,
+                    transport_id=transport_id,
+                    client=pipe,
+                )
             await pipe.execute()
 
         return deliveries
@@ -1033,70 +1433,186 @@ class _RedisConsumer(Consumer):
         return await self._build_deliveries(entries, redelivered=False)
 
     async def ack(self, delivery: Delivery) -> None:
+        await self._acknowledge_delivery(
+            delivery,
+            release_deduplication=True,
+        )
+
+    async def ack_for_retry(self, delivery: Delivery) -> None:
+        await self._acknowledge_delivery(
+            delivery,
+            release_deduplication=False,
+        )
+
+    async def _acknowledge_delivery(
+        self,
+        delivery: Delivery,
+        *,
+        release_deduplication: bool,
+    ) -> None:
         if delivery.transport_id is None:
-            await self.broker.release_deduplication_for_message(delivery.message)
-            return
-
-        pipe = self.broker.client.pipeline()
-        pipe.xack(self.stream_key, self.broker.group_name, delivery.transport_id)
-        pipe.xdel(self.stream_key, delivery.transport_id)
-        await pipe.execute()
-        self.active_ids.discard(delivery.transport_id)
-        await self.broker.release_deduplication_for_message(delivery.message)
-
-    async def reject(self, delivery: Delivery, *, requeue: bool = False) -> None:
-        if requeue:
-            await self.broker.send(delivery.message)
-
-        if delivery.transport_id is None:
-            if not requeue:
+            if release_deduplication:
                 await self.broker.release_deduplication_for_message(delivery.message)
             return
 
-        pipe = self.broker.client.pipeline()
-        pipe.xack(self.stream_key, self.broker.group_name, delivery.transport_id)
-        pipe.xdel(self.stream_key, delivery.transport_id)
+        registry_message_id = self._registry_message_id(delivery)
+        await self.broker.scripts.acknowledge_delivery(
+            stream_key=self.stream_key,
+            payload_key=self.broker._message_key(registry_message_id),
+            payload_ref_key=self.broker._message_ref_key(registry_message_id),
+            group_name=self.broker.group_name,
+            transport_id=delivery.transport_id,
+        )
+        self.active_ids.discard(delivery.transport_id)
+        if release_deduplication:
+            await self.broker.release_deduplication_for_message(delivery.message)
 
-        if not requeue:
-            record = coerce_dead_letter_record(
-                delivery.metadata.get("dead_letter_record"),
-                namespace=self.broker.namespace,
-                queue_name=self.queue_name,
-                actor_name=delivery.actor_name,
-                message=delivery.message,
-                delivery_id=delivery.transport_id,
-                consumer_name=self.consumer_name,
-                failure_kind="operator_reject",
-                execution_mode=delivery.metadata.get("execution_mode", "async"),
-                retention_deadline_ms=int(time.time() * 1000) + self.broker.dead_letter_ttl_ms,
+    async def reject(self, delivery: Delivery, *, requeue: bool = False) -> None:
+        if requeue:
+            await self.broker.send_for_retry(delivery.message)
+            await self._acknowledge_delivery(
+                delivery,
+                release_deduplication=False,
             )
-            self.broker._queue_dead_letter_record_commands(pipe, record)
+            return
+
+        if delivery.transport_id is None:
+            await self.broker.release_deduplication_for_message(delivery.message)
+            return
+
+        pipe = self.broker.client.pipeline()
+        record = coerce_dead_letter_record(
+            delivery.metadata.get("dead_letter_record"),
+            namespace=self.broker.namespace,
+            queue_name=self.queue_name,
+            actor_name=delivery.actor_name,
+            message=delivery.message,
+            delivery_id=delivery.transport_id,
+            consumer_name=self.consumer_name,
+            failure_kind="operator_reject",
+            execution_mode=delivery.metadata.get("execution_mode", "async"),
+            retention_deadline_ms=int(time.time() * 1000) + self.broker.dead_letter_ttl_ms,
+        )
+        self.broker._queue_dead_letter_record_commands(pipe, record)
+        registry_message_id = self._registry_message_id(delivery)
+        await self.broker.scripts.acknowledge_delivery(
+            stream_key=self.stream_key,
+            payload_key=self.broker._message_key(registry_message_id),
+            payload_ref_key=self.broker._message_ref_key(registry_message_id),
+            group_name=self.broker.group_name,
+            transport_id=delivery.transport_id,
+            client=pipe,
+        )
 
         await pipe.execute()
         self.active_ids.discard(delivery.transport_id)
-        if not requeue:
-            await self.broker.release_deduplication_for_message(delivery.message)
+        await self.broker.release_deduplication_for_message(delivery.message)
 
     async def extend_lease(self, delivery: Delivery, *, seconds: float) -> None:
         if delivery.transport_id is None:
             return
 
-        await self.broker.client.xclaim(
-            self.stream_key,
-            self.broker.group_name,
-            self.consumer_name,
-            0,
-            [delivery.transport_id],
-            idle=0,
+        loop = asyncio.get_running_loop()
+        completed: asyncio.Future[None] = loop.create_future()
+        self._pending_lease_extensions.setdefault(float(seconds), []).append(
+            (delivery, completed)
         )
-        delivery.lease_deadline = time.time() + seconds
-        delivery.metadata["lease_seconds"] = seconds
+        if (
+            self._lease_extension_flush_task is None
+            or self._lease_extension_flush_task.done()
+        ):
+            self._lease_extension_flush_task = asyncio.create_task(
+                self._flush_lease_extensions(),
+                name=f"fluxera-lease-batch:{self.queue_name}:{self.consumer_name}",
+            )
+        await completed
+
+    async def _flush_lease_extensions(self) -> None:
+        try:
+            await asyncio.sleep(self.broker.lease_extension_batch_window_seconds)
+            while self._pending_lease_extensions:
+                batches = self._pending_lease_extensions
+                self._pending_lease_extensions = {}
+                for seconds, requests in batches.items():
+                    await self._extend_lease_batch(requests, seconds=seconds)
+                await asyncio.sleep(0)
+        finally:
+            self._lease_extension_flush_task = None
+            if self._pending_lease_extensions:
+                self._lease_extension_flush_task = asyncio.create_task(
+                    self._flush_lease_extensions(),
+                    name=f"fluxera-lease-batch:{self.queue_name}:{self.consumer_name}",
+                )
+
+    async def _extend_lease_batch(
+        self,
+        requests: list[tuple[Delivery, asyncio.Future[None]]],
+        *,
+        seconds: float,
+    ) -> None:
+        batch_size = self.broker.lease_extension_batch_size
+        for offset in range(0, len(requests), batch_size):
+            chunk = requests[offset : offset + batch_size]
+            transport_ids = [
+                delivery.transport_id
+                for delivery, _completed in chunk
+                if delivery.transport_id is not None
+            ]
+            try:
+                claimed = await self.broker.client.xclaim(
+                    self.stream_key,
+                    self.broker.group_name,
+                    self.consumer_name,
+                    0,
+                    transport_ids,
+                    idle=0,
+                    justid=True,
+                )
+            except BaseException as exc:
+                for _delivery, completed in chunk:
+                    if not completed.done():
+                        completed.set_exception(exc)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                continue
+
+            claimed_ids = {
+                _decode_stream_id(transport_id)
+                for transport_id in claimed
+            }
+            lease_deadline = time.time() + seconds
+            for delivery, completed in chunk:
+                transport_id = delivery.transport_id
+                if transport_id in claimed_ids:
+                    delivery.lease_deadline = lease_deadline
+                    delivery.metadata["lease_seconds"] = seconds
+                    if not completed.done():
+                        completed.set_result(None)
+                    continue
+
+                if transport_id not in self.active_ids:
+                    if not completed.done():
+                        completed.set_result(None)
+                    continue
+
+                if not completed.done():
+                    completed.set_exception(
+                        RuntimeError(
+                            f"Redis did not extend active delivery lease {transport_id!r}."
+                        )
+                    )
 
     async def close(self, *, forget: bool = False) -> None:
         if self._closed and not forget:
             return
 
         self._closed = True
+        if self._lease_extension_flush_task is not None:
+            await asyncio.gather(
+                self._lease_extension_flush_task,
+                return_exceptions=True,
+            )
+            self._lease_extension_flush_task = None
         if not forget:
             return
 

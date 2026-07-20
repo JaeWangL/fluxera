@@ -4,6 +4,8 @@ local messageKeyPrefix = KEYS[1]
 local streamKey = KEYS[2]
 local delayedKey = KEYS[3]
 local dedupeKey = KEYS[4]
+local queueRegistryKey = KEYS[5]
+local messageRefKeyPrefix = KEYS[6]
 
 local messageId = ARGV[1]
 local encodedMessage = ARGV[2]
@@ -14,13 +16,42 @@ local ttlMs = tonumber(ARGV[6])
 local extend = tonumber(ARGV[7])
 local replace = tonumber(ARGV[8])
 local messageTtlMs = tonumber(ARGV[9])
+local queueName = ARGV[10]
+
+rcall("SADD", queueRegistryKey, queueName)
 
 local function messageKey(message_id)
     return messageKeyPrefix .. message_id
 end
 
+local function messageRefKey(message_id)
+    return messageRefKeyPrefix .. message_id
+end
+
 local function storeMessage()
-    rcall("SET", messageKey(messageId), encodedMessage, "PX", messageTtlMs)
+    local payloadKey = messageKey(messageId)
+    local refKey = messageRefKey(messageId)
+    if rcall("EXISTS", payloadKey) == 1 and rcall("EXISTS", refKey) == 0 then
+        rcall("SET", refKey, 1, "PX", messageTtlMs)
+    end
+    rcall("SET", payloadKey, encodedMessage, "PX", messageTtlMs)
+    rcall("INCR", refKey)
+    rcall("PEXPIRE", refKey, messageTtlMs)
+end
+
+local function releaseMessage(message_id)
+    local payloadKey = messageKey(message_id)
+    local refKey = messageRefKey(message_id)
+    local refs = rcall("GET", refKey)
+    if not refs then
+        rcall("DEL", payloadKey)
+        return
+    end
+
+    local remaining = rcall("DECR", refKey)
+    if remaining <= 0 then
+        rcall("DEL", payloadKey, refKey)
+    end
 end
 
 local function enqueueMessage()
@@ -83,7 +114,7 @@ if mode == "debounce" then
     local existing = rcall("GET", dedupeKey)
     if existing then
         rcall("ZREM", delayedKey, existing)
-        rcall("DEL", messageKey(existing))
+        releaseMessage(existing)
         if ttlMs > 0 then
             if extend == 1 then
                 rcall("SET", dedupeKey, messageId, "PX", ttlMs)

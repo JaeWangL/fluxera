@@ -53,6 +53,7 @@ Useful flags:
 - `--process-concurrency 0`: disable the process lane explicitly
 - `--exit-when-idle`: drain current work and exit
 - `--worker-revision REVISION`: set rollout revision explicitly
+- `--worker-presence-interval 5`: publish presence less often while still polling revisions promptly
 
 ## Your First Async Actor
 
@@ -257,7 +258,8 @@ fluxera monitor serve \
   --redis-url redis://127.0.0.1:6379/15 \
   --namespace my-app \
   --host 0.0.0.0 \
-  --port 8090
+  --port 8090 \
+  --snapshot-cache-seconds 25
 ```
 
 Then open:
@@ -506,7 +508,27 @@ The current `RedisBroker` uses Redis Streams plus a message registry:
 - stream entries store `message_id`
 - delayed jobs store `message_id`
 - payloads live under `namespace:message:{message_id}`
+- payload reference counts live under `namespace:message_ref:{message_id}`
+- discovered queues live in `namespace:registry:queues`
 - Lua scripts handle deduplication and idempotency state transitions
+
+Terminal ACK and terminal dead-letter paths delete the stream entry and release
+the payload reference atomically. Retries and requeues first create the next
+reference, so the shared payload remains available between attempts.
+
+Queue discovery defaults to `auto`: it dual-reads legacy keys and backfills the
+registry for `300s`, then uses the registry without a keyspace scan. During a
+mixed-version rollout lasting longer than that grace period, use
+`runtime_queue_discovery_mode="dual"` in operational broker instances until all
+producers and workers write the registry. The explicit
+`reconcile_runtime_queue_registry(remove_stale=True)` API can remove confirmed
+stale entries.
+
+Worker revision reads use one `MGET` for all managed queues. Presence writes
+default to every `5s`, happen immediately on acceptance-state changes, and are
+capped at one third of `worker_presence_ttl_seconds`. Configure this with
+`Worker(worker_presence_interval=...)`,
+`FLUXERA_WORKER_PRESENCE_INTERVAL_SECONDS`, or the CLI flag shown above.
 
 This layout keeps transport entries small and makes debounce, dedupe, and idempotency contracts easier to evolve.
 
@@ -528,11 +550,11 @@ These cover:
 
 ## Current Limits
 
-`0.2.5` is an early alpha, so a few edges are still intentionally narrow:
+`0.3.0` is an early alpha, so a few edges are still intentionally narrow:
 
 - public APIs may change
 - result backends are not implemented yet
-- queue-specific garbage collection for the message registry is still simple
+- abnormal or administratively removed payloads still rely on message-registry TTL cleanup
 - process start-method policy should be hardened before broad production rollout
 
 ## Where To Go Next

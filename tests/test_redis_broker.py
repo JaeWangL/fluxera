@@ -6,8 +6,9 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import orjson
@@ -120,17 +121,72 @@ class RedisBrokerGroupCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(broker.promote_due_interval_seconds, 0.5)
         self.assertEqual(broker.stale_claim_interval_seconds, 0.75)
 
+    async def test_join_backoff_resets_when_queue_state_changes(self) -> None:
+        broker = fluxera.RedisBroker(
+            "redis://127.0.0.1:6379/15",
+            join_poll_interval_seconds=0.1,
+            join_poll_interval_max_seconds=0.5,
+            join_poll_interval_multiplier=2.0,
+        )
+        self.addAsyncCleanup(broker.close)
+        broker.declare_queue("default")
+        broker._promote_due = AsyncMock(return_value=0)
+        broker.client.zcard = AsyncMock(return_value=0)
+        broker.client.exists = AsyncMock(return_value=1)
+        broker.client.xlen = AsyncMock(side_effect=[3, 3, 2, 2, 0])
+        broker.client.xpending = AsyncMock(return_value={"pending": 0})
+        sleep = AsyncMock()
+
+        with patch("fluxera.brokers.redis.asyncio.sleep", sleep):
+            await broker.join("default")
+
+        self.assertEqual(
+            [call.args[0] for call in sleep.await_args_list],
+            [0.1, 0.2, 0.1, 0.2],
+        )
+
     async def test_ensure_group_caches_successful_creation(self) -> None:
         broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15")
         self.addAsyncCleanup(broker.close)
         create = AsyncMock()
+        register_runtime_queue = AsyncMock()
         broker.client.xgroup_create = create
+        broker._register_runtime_queue = register_runtime_queue
 
         await broker._ensure_group("default")
         await broker._ensure_group("default")
 
         self.assertEqual(create.await_count, 1)
+        register_runtime_queue.assert_awaited_once_with("default", force=True)
         self.assertEqual(broker._ensured_groups, {"default"})
+
+    async def test_get_serving_revisions_uses_one_mget(self) -> None:
+        broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15")
+        self.addAsyncCleanup(broker.close)
+        broker.client.mget = AsyncMock(return_value=[b"rev-a", None])
+
+        revisions = await broker.get_serving_revisions({"beta", "alpha"})
+
+        self.assertEqual(revisions, {"alpha": "rev-a", "beta": None})
+        broker.client.mget.assert_awaited_once_with(
+            broker._serving_revision_key("alpha"),
+            broker._serving_revision_key("beta"),
+        )
+
+    async def test_worker_presence_interval_is_capped_by_broker_ttl(self) -> None:
+        broker = fluxera.RedisBroker(
+            "redis://127.0.0.1:6379/15",
+            worker_presence_ttl_seconds=3.0,
+        )
+        self.addAsyncCleanup(broker.close)
+
+        worker = fluxera.Worker(
+            broker,
+            process_concurrency=0,
+            worker_presence_interval=5.0,
+        )
+
+        self.assertEqual(worker.worker_presence_interval, 1.0)
 
     async def test_ensure_group_caches_existing_group(self) -> None:
         broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15")
@@ -138,24 +194,31 @@ class RedisBrokerGroupCacheTests(unittest.IsolatedAsyncioTestCase):
         create = AsyncMock(
             side_effect=ResponseError("BUSYGROUP Consumer Group name already exists")
         )
+        register_runtime_queue = AsyncMock()
         broker.client.xgroup_create = create
+        broker._register_runtime_queue = register_runtime_queue
 
         await broker._ensure_group("default")
         await broker._ensure_group("default")
 
         self.assertEqual(create.await_count, 1)
+        register_runtime_queue.assert_awaited_once_with("default", force=True)
         self.assertEqual(broker._ensured_groups, {"default"})
 
     async def test_ensure_group_force_rechecks_redis(self) -> None:
         broker = fluxera.RedisBroker("redis://127.0.0.1:6379/15")
         self.addAsyncCleanup(broker.close)
         create = AsyncMock()
+        register_runtime_queue = AsyncMock()
         broker.client.xgroup_create = create
+        broker._register_runtime_queue = register_runtime_queue
 
         await broker._ensure_group("default")
         await broker._ensure_group("default", force=True)
 
         self.assertEqual(create.await_count, 2)
+        self.assertEqual(register_runtime_queue.await_count, 2)
+        register_runtime_queue.assert_awaited_with("default", force=True)
 
 
 class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -277,6 +340,237 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         delayed_payload = await self.redis.get(broker._message_key(delayed.message_id))
         self.assertEqual(broker._decode_message(immediate_payload), immediate)
         self.assertEqual(broker._decode_message(delayed_payload), delayed)
+        self.assertEqual(
+            await self.redis.smembers(broker._queue_registry_key()),
+            {b"default"},
+        )
+
+    async def test_queue_registry_is_written_by_sync_send_and_worker_presence(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, queue_name="sync-queue")
+        async def remember(value: str) -> None:
+            del value
+
+        await asyncio.to_thread(remember.send_sync, "alpha")
+        await broker.register_worker_revision(
+            worker_id="registry-worker",
+            worker_revision="rev-a",
+            queue_states={
+                "worker-alpha": "accepting",
+                "worker-beta": "draining",
+            },
+        )
+
+        self.assertEqual(
+            await self.redis.smembers(broker._queue_registry_key()),
+            {b"sync-queue", b"worker-alpha", b"worker-beta"},
+        )
+
+        await self.redis.delete(broker._queue_registry_key())
+        await broker.register_worker_revision(
+            worker_id="registry-worker",
+            worker_revision="rev-a",
+            queue_states={
+                "worker-alpha": "accepting",
+                "worker-beta": "draining",
+            },
+        )
+        self.assertEqual(
+            await self.redis.smembers(broker._queue_registry_key()),
+            {b"worker-alpha", b"worker-beta"},
+        )
+
+    async def test_runtime_queue_list_dual_reads_and_backfills_registry(self) -> None:
+        broker = self.make_broker()
+        await self.redis.set(
+            broker._serving_revision_key("legacy-queue"),
+            "rev-legacy",
+        )
+        await self.redis.sadd(
+            broker._queue_registry_key(),
+            "registry-only",
+        )
+
+        queue_names = await broker.list_runtime_queues()
+
+        self.assertIn("legacy-queue", queue_names)
+        self.assertIn("registry-only", queue_names)
+        self.assertEqual(
+            await self.redis.smembers(broker._queue_registry_key()),
+            {b"legacy-queue", b"registry-only"},
+        )
+
+    async def test_runtime_queue_reconciliation_removes_only_confirmed_stale_entries(self) -> None:
+        broker = self.make_broker()
+        await self.redis.sadd(
+            broker._queue_registry_key(),
+            "active-queue",
+            "stale-queue",
+        )
+        await self.redis.set(
+            broker._serving_revision_key("active-queue"),
+            "rev-active",
+        )
+
+        result = await broker.reconcile_runtime_queue_registry(
+            remove_stale=True,
+        )
+
+        self.assertEqual(result["removed"], ["stale-queue"])
+        self.assertEqual(
+            await self.redis.smembers(broker._queue_registry_key()),
+            {b"active-queue"},
+        )
+
+    async def test_runtime_queue_reconciliation_rechecks_runtime_keys_before_removal(self) -> None:
+        broker = self.make_broker()
+        await self.redis.sadd(
+            broker._queue_registry_key(),
+            "concurrent-queue",
+        )
+        broker._scan_runtime_queues = AsyncMock(return_value=set())
+        await self.redis.set(
+            broker._serving_revision_key("concurrent-queue"),
+            "rev-concurrent",
+        )
+
+        result = await broker.reconcile_runtime_queue_registry(
+            remove_stale=True,
+        )
+
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(
+            await self.redis.smembers(broker._queue_registry_key()),
+            {b"concurrent-queue"},
+        )
+
+    async def test_batched_runtime_queue_rows_match_single_queue_reads(self) -> None:
+        broker = self.make_broker(runtime_queue_batch_size=2)
+        await self.redis.set(
+            broker._serving_revision_key("alpha"),
+            "rev-a",
+        )
+        await self.redis.zadd(
+            broker._delayed_key("beta"),
+            {"message-beta": int(time.time() * 1000) + 60_000},
+        )
+        await self.redis.zadd(
+            broker._workers_key("alpha"),
+            {"worker-a": int(time.time() * 1000)},
+        )
+        await broker._ensure_group("alpha")
+        await self.redis.xadd(
+            broker._stream_key("alpha"),
+            {"message_id": "message-alpha"},
+        )
+
+        queue_names = ["alpha", "beta", "gamma"]
+        expected = [
+            await broker.get_queue_runtime_row(queue_name)
+            for queue_name in queue_names
+        ]
+        actual = await broker.get_queue_runtime_rows(
+            queue_names,
+            include_worker_ids=True,
+        )
+
+        self.assertEqual(actual, expected)
+
+    async def test_batched_runtime_queue_rows_can_skip_worker_members(self) -> None:
+        broker = self.make_broker(runtime_queue_batch_size=100)
+        queue_names = [f"queue-{index}" for index in range(4)]
+        for queue_name in queue_names:
+            await self.redis.zadd(
+                broker._workers_key(queue_name),
+                {"worker-a": int(time.time() * 1000)},
+            )
+
+        await self.redis.config_resetstat()
+        rows = await broker.get_queue_runtime_rows(
+            queue_names,
+            include_worker_ids=False,
+        )
+        commandstats = await self.redis.info("commandstats")
+
+        self.assertTrue(all(row["worker_ids"] == [] for row in rows))
+        self.assertNotIn("cmdstat_zrange", commandstats)
+
+    async def test_worker_runtime_rows_use_known_queue_sets_without_keyspace_scan(self) -> None:
+        broker = self.make_broker(runtime_queue_batch_size=2)
+        await broker.register_worker_revision(
+            worker_id="worker-alpha",
+            worker_revision="rev-a",
+            queue_states={
+                "alpha": "accepting",
+                "beta": "draining",
+            },
+        )
+        broker.client.scan_iter = MagicMock(
+            side_effect=AssertionError("keyspace SCAN should not be used"),
+        )
+
+        rows = await broker.list_worker_runtime_rows(
+            queue_names={"alpha", "beta"},
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["worker_id"], "worker-alpha")
+        broker.client.scan_iter.assert_not_called()
+
+    async def test_worker_runtime_rows_skip_keyspace_scan_for_empty_queue_set(self) -> None:
+        broker = self.make_broker()
+        broker.client.scan_iter = MagicMock(
+            side_effect=AssertionError("keyspace SCAN should not be used"),
+        )
+
+        rows = await broker.list_worker_runtime_rows(queue_names=set())
+
+        self.assertEqual(rows, [])
+        broker.client.scan_iter.assert_not_called()
+
+    async def test_auto_queue_discovery_switches_to_registry_after_grace(self) -> None:
+        broker = self.make_broker(
+            runtime_queue_discovery_mode="auto",
+            queue_registry_migration_grace_seconds=0,
+        )
+        await self.redis.sadd(
+            broker._queue_registry_key(),
+            "registered-queue",
+        )
+
+        first = await broker.list_runtime_queues()
+        self.assertIn("registered-queue", first)
+        broker._scan_runtime_queues = AsyncMock(
+            side_effect=AssertionError("SCAN should not run after migration grace"),
+        )
+
+        second = await broker.list_runtime_queues()
+
+        self.assertEqual(second, ["registered-queue"])
+        broker._scan_runtime_queues.assert_not_awaited()
+
+    async def test_auto_queue_discovery_falls_back_when_registry_is_empty(self) -> None:
+        broker = self.make_broker(
+            runtime_queue_discovery_mode="auto",
+            queue_registry_migration_grace_seconds=0,
+        )
+        await self.redis.set(
+            broker._queue_registry_migrated_at_key(),
+            1,
+        )
+        broker._scan_runtime_queues = AsyncMock(
+            return_value={"fallback-queue"},
+        )
+
+        queue_names = await broker.list_runtime_queues()
+
+        self.assertEqual(queue_names, ["fallback-queue"])
+        broker._scan_runtime_queues.assert_awaited_once()
+        self.assertEqual(
+            await self.redis.smembers(broker._queue_registry_key()),
+            {b"fallback-queue"},
+        )
 
     async def test_simple_dedupe_releases_key_on_terminal_ack(self) -> None:
         broker = self.make_broker()
@@ -301,6 +595,192 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(await self.redis.get(dedupe_key))
         await consumer.close()
+
+    async def test_terminal_ack_deletes_payload_and_reference(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, actor_name="terminal_ack", queue_name="default")
+        async def noop() -> None:
+            return None
+
+        message = await noop.send()
+        self.assertEqual(
+            await self.redis.get(broker._message_ref_key(message.message_id)),
+            b"1",
+        )
+        consumer = await broker.open_consumer(noop.queue_name)
+        delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+
+        await consumer.ack(delivery)
+
+        self.assertIsNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertIsNone(await self.redis.get(broker._message_ref_key(message.message_id)))
+        await consumer.close()
+
+    async def test_terminal_ack_uses_stream_message_id_when_payload_id_differs(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, actor_name="transport_ack", queue_name="default")
+        async def noop() -> None:
+            return None
+
+        message = await noop.send()
+        embedded_message = fluxera.Message(
+            queue_name=noop.queue_name,
+            actor_name=noop.actor_name,
+            message_id="embedded-message-id",
+        )
+        await self.redis.set(
+            broker._message_key(message.message_id),
+            broker._encode_message(embedded_message),
+        )
+        await self.redis.set(
+            broker._message_key(embedded_message.message_id),
+            b"must-remain",
+        )
+        await self.redis.set(
+            broker._message_ref_key(embedded_message.message_id),
+            b"1",
+        )
+
+        consumer = await broker.open_consumer(noop.queue_name)
+        delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+        self.assertEqual(delivery.message_id, embedded_message.message_id)
+        self.assertEqual(delivery.metadata["message_id"], message.message_id)
+
+        await consumer.ack(delivery)
+
+        self.assertIsNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertIsNone(await self.redis.get(broker._message_ref_key(message.message_id)))
+        self.assertEqual(
+            await self.redis.get(broker._message_key(embedded_message.message_id)),
+            b"must-remain",
+        )
+        self.assertEqual(
+            await self.redis.get(broker._message_ref_key(embedded_message.message_id)),
+            b"1",
+        )
+        await consumer.close()
+
+    async def test_duplicate_message_id_keeps_payload_until_last_ack(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, actor_name="duplicate_ref", queue_name="default")
+        async def noop() -> None:
+            return None
+
+        message = noop.message()
+        await broker.send(message)
+        await broker.send(message)
+        self.assertEqual(
+            await self.redis.get(broker._message_ref_key(message.message_id)),
+            b"2",
+        )
+        consumer = await broker.open_consumer(noop.queue_name, prefetch=2)
+        deliveries = await consumer.receive(limit=2, timeout=1.0)
+
+        await consumer.ack(deliveries[0])
+        self.assertIsNotNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertEqual(
+            await self.redis.get(broker._message_ref_key(message.message_id)),
+            b"1",
+        )
+
+        await consumer.ack(deliveries[1])
+        self.assertIsNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertIsNone(await self.redis.get(broker._message_ref_key(message.message_id)))
+        await consumer.close()
+
+    async def test_retry_migrates_legacy_payload_without_deleting_next_attempt(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, actor_name="legacy_retry", queue_name="default")
+        async def noop() -> None:
+            return None
+
+        message = await noop.send()
+        await self.redis.delete(broker._message_ref_key(message.message_id))
+        consumer = await broker.open_consumer(noop.queue_name)
+        first_delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+
+        await broker.send_for_retry(first_delivery.message)
+        await consumer.ack_for_retry(first_delivery)
+
+        self.assertIsNotNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertEqual(
+            await self.redis.get(broker._message_ref_key(message.message_id)),
+            b"1",
+        )
+        retry_delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+        await consumer.ack(retry_delivery)
+
+        self.assertIsNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertIsNone(await self.redis.get(broker._message_ref_key(message.message_id)))
+        await consumer.close()
+
+    async def test_requeue_preserves_payload_until_requeued_delivery_finishes(self) -> None:
+        broker = self.make_broker()
+
+        @fluxera.actor(broker=broker, actor_name="requeue_ref", queue_name="default")
+        async def noop() -> None:
+            return None
+
+        message = await noop.send()
+        consumer = await broker.open_consumer(noop.queue_name)
+        first_delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+
+        await consumer.reject(first_delivery, requeue=True)
+
+        self.assertIsNotNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertEqual(
+            await self.redis.get(broker._message_ref_key(message.message_id)),
+            b"1",
+        )
+        requeued_delivery = (await consumer.receive(limit=1, timeout=1.0))[0]
+        await consumer.ack(requeued_delivery)
+        self.assertIsNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertIsNone(await self.redis.get(broker._message_ref_key(message.message_id)))
+        await consumer.close()
+
+    async def test_deduplicated_message_retries_and_releases_payload_terminally(self) -> None:
+        broker = self.make_broker()
+        attempts = 0
+
+        @fluxera.actor(
+            broker=broker,
+            actor_name="dedupe_retry",
+            queue_name="default",
+            max_retries=1,
+            min_backoff=0,
+        )
+        async def flaky() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("retry once")
+
+        message = await flaky.send_with_options(job_id="dedupe-retry-job")
+        worker = fluxera.Worker(
+            broker,
+            concurrency=1,
+            process_concurrency=0,
+        )
+        await worker.start()
+        try:
+            await broker.join(flaky.queue_name)
+        finally:
+            await worker.stop()
+
+        dedupe_key = broker._dedupe_key(
+            flaky.queue_name,
+            flaky.actor_name,
+            "dedupe-retry-job",
+        )
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(worker.record_history[message.message_id]), 2)
+        self.assertIsNone(await self.redis.get(dedupe_key))
+        self.assertIsNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertIsNone(await self.redis.get(broker._message_ref_key(message.message_id)))
 
     async def test_consumer_recreates_missing_group_after_stream_deleted(self) -> None:
         broker = self.make_broker()
@@ -459,6 +939,37 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         await broker.unregister_worker_revision(worker_id=worker_id, queue_names={"default"})
         self.assertEqual(await self.redis.exists(broker._worker_key(worker_id)), 0)
+
+    async def test_readiness_probe_reuses_async_and_sync_connections(self) -> None:
+        probe = fluxera.RedisReadinessProbe(
+            self.redis_url,
+            namespace=self.namespace,
+            timeout_seconds=1.0,
+        )
+        try:
+            first_async = await probe.check()
+            second_async = await probe.check()
+            first_sync = await asyncio.to_thread(probe.check_sync)
+            second_sync = await asyncio.to_thread(probe.check_sync)
+
+            self.assertTrue(first_async["healthy"])
+            self.assertTrue(second_async["healthy"])
+            self.assertTrue(first_sync["healthy"])
+            self.assertTrue(second_sync["healthy"])
+
+            clients = await self.redis.client_list()
+            async_name = f"fluxera-admin-readiness:{self.namespace}:async"
+            sync_name = f"fluxera-admin-readiness:{self.namespace}:sync"
+            self.assertEqual(
+                sum(client.get("name") == async_name for client in clients),
+                1,
+            )
+            self.assertEqual(
+                sum(client.get("name") == sync_name for client in clients),
+                1,
+            )
+        finally:
+            await probe.close()
 
     async def test_revision_cli_get_and_promote(self) -> None:
         broker = self.make_broker()
@@ -828,6 +1339,73 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(attempts), 1)
 
+    async def test_lease_extensions_are_batched_without_incrementing_delivery_count(self) -> None:
+        broker = self.make_broker(
+            lease_seconds=1.0,
+            lease_extension_batch_size=16,
+            lease_extension_batch_window_seconds=0.001,
+        )
+
+        async def noop() -> None:
+            return None
+
+        actor = fluxera.actor(
+            broker=broker,
+            actor_name="lease_batch",
+            queue_name="default",
+        )(noop)
+        for _ in range(8):
+            await actor.send()
+
+        consumer = await broker.open_consumer(actor.queue_name, prefetch=8)
+        deliveries = await consumer.receive(limit=8, timeout=1.0)
+        self.assertEqual(len(deliveries), 8)
+        pending_before = await self.redis.xpending_range(
+            broker._stream_key(actor.queue_name),
+            broker.group_name,
+            "-",
+            "+",
+            8,
+        )
+        before_counts = {
+            entry["message_id"]: int(entry["times_delivered"])
+            for entry in pending_before
+        }
+
+        await self.redis.config_resetstat()
+        await asyncio.gather(
+            *[
+                consumer.extend_lease(delivery, seconds=1.0)
+                for delivery in deliveries
+            ]
+        )
+        commandstats = await self.redis.info("commandstats")
+
+        self.assertEqual(commandstats["cmdstat_xclaim"]["calls"], 1)
+        pending_after = await self.redis.xpending_range(
+            broker._stream_key(actor.queue_name),
+            broker.group_name,
+            "-",
+            "+",
+            8,
+        )
+        after_counts = {
+            entry["message_id"]: int(entry["times_delivered"])
+            for entry in pending_after
+        }
+        self.assertEqual(after_counts, before_counts)
+        self.assertTrue(
+            all(
+                delivery.lease_deadline is not None
+                and delivery.lease_deadline > time.time()
+                for delivery in deliveries
+            )
+        )
+
+        await asyncio.gather(*[consumer.ack(delivery) for delivery in deliveries])
+        await consumer.close()
+        await broker.join(actor.queue_name)
+
     async def test_consumer_does_not_redeliver_its_own_stale_in_flight_message(self) -> None:
         broker = self.make_broker(lease_seconds=0.05)
 
@@ -869,7 +1447,7 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             queue_name="default",
         )(noop)
 
-        await actor.send()
+        message = await actor.send()
         consumer = await broker.open_consumer(actor.queue_name)
         deliveries = await consumer.receive(limit=1, timeout=1.0)
         self.assertEqual(len(deliveries), 1)
@@ -885,6 +1463,8 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dead_letter_records[0].actor_name, actor.actor_name)
         self.assertEqual(dead_letter_records[0].message_id, deliveries[0].message_id)
         self.assertEqual(dead_letters[0].message_id, deliveries[0].message_id)
+        self.assertIsNone(await self.redis.get(broker._message_key(message.message_id)))
+        self.assertIsNone(await self.redis.get(broker._message_ref_key(message.message_id)))
         await consumer.close()
 
     async def test_dead_letter_records_can_be_requeued_and_purged(self) -> None:
@@ -959,6 +1539,7 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(records[0].payload_available)
 
         self.assertEqual(await self.redis.xlen(broker._stream_key(noop.queue_name)), 0)
+        self.assertIsNone(await self.redis.get(broker._message_ref_key(message.message_id)))
         await consumer.close()
 
     async def test_at_least_once_recovers_after_worker_process_crash(self) -> None:

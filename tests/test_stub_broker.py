@@ -93,6 +93,36 @@ class _FlakyRevisionStubBroker(fluxera.StubBroker):
         )
 
 
+class _CountingRevisionStubBroker(fluxera.StubBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_revision_calls = 0
+        self.register_calls = 0
+
+    async def get_serving_revisions(
+        self,
+        queue_names: set[str],
+    ) -> dict[str, str | None]:
+        self.batch_revision_calls += 1
+        return await super().get_serving_revisions(queue_names)
+
+    async def register_worker_revision(
+        self,
+        *,
+        worker_id: str,
+        worker_revision: str,
+        queue_states: dict[str, str],
+        runtime_state: dict[str, object] | None = None,
+    ) -> None:
+        self.register_calls += 1
+        await super().register_worker_revision(
+            worker_id=worker_id,
+            worker_revision=worker_revision,
+            queue_states=queue_states,
+            runtime_state=runtime_state,
+        )
+
+
 class _RedeliverOnceConsumer(fluxera.Consumer):
     def __init__(self, base: fluxera.Consumer) -> None:
         self._base = base
@@ -879,6 +909,7 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
             prefetch=1,
             poll_timeout=0.01,
             revision_poll_interval=0.01,
+            worker_presence_interval=0.01,
             worker_revision="rev-heartbeat",
         )
         await worker.start()
@@ -892,6 +923,74 @@ class StubBrokerWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(processed, [11])
         self.assertGreaterEqual(worker.metrics_revision_heartbeat_failures, 1)
         self.assertNotIn(worker.worker_id, broker.worker_revisions)
+
+    async def test_failed_state_change_presence_write_retries_without_waiting_for_refresh(self) -> None:
+        broker = _FlakyRevisionStubBroker(fail_on_register_call=2)
+        broker.declare_queue("alpha")
+        worker = fluxera.Worker(
+            broker,
+            queues={"alpha"},
+            concurrency=1,
+            process_concurrency=0,
+            revision_poll_interval=0.05,
+            worker_presence_interval=1.0,
+            worker_revision="rev-a",
+        )
+        await worker.start()
+        try:
+            await broker.promote_serving_revision(
+                "alpha",
+                "rev-b",
+                expected_revision="rev-a",
+            )
+            await wait_for_async(
+                lambda: broker.register_calls >= 3,
+                timeout=0.5,
+            )
+            self.assertEqual(
+                broker.worker_queue_states[worker.worker_id]["alpha"],
+                "draining",
+            )
+        finally:
+            await worker.stop()
+
+    async def test_revision_polling_batches_reads_and_only_publishes_on_change(self) -> None:
+        broker = _CountingRevisionStubBroker()
+        broker.declare_queue("alpha")
+        broker.declare_queue("beta")
+        worker = fluxera.Worker(
+            broker,
+            queues={"alpha", "beta"},
+            concurrency=1,
+            process_concurrency=0,
+            revision_poll_interval=0.01,
+            worker_presence_interval=1.0,
+            worker_revision="rev-a",
+        )
+        await worker.start()
+        try:
+            await wait_for_async(
+                lambda: broker.batch_revision_calls >= 3,
+                timeout=2.0,
+            )
+            self.assertEqual(broker.register_calls, 1)
+
+            await broker.promote_serving_revision(
+                "alpha",
+                "rev-b",
+                expected_revision="rev-a",
+            )
+            await wait_for_async(
+                lambda: worker.queue_states.get("alpha") == "draining",
+                timeout=2.0,
+            )
+            self.assertEqual(broker.register_calls, 2)
+            self.assertEqual(
+                broker.worker_queue_states[worker.worker_id]["alpha"],
+                "draining",
+            )
+        finally:
+            await worker.stop()
 
     async def test_scheduler_lane_crash_is_supervised_and_restarted(self) -> None:
         broker = fluxera.StubBroker()

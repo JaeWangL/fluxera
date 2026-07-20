@@ -40,6 +40,7 @@ DEFAULT_RATE_LIMIT_DEFER_MS = 1_000
 DEFAULT_CONSUMER_IDLE_BACKOFF_MAX_SECONDS = 1.0
 DEFAULT_CONSUMER_IDLE_BACKOFF_MULTIPLIER = 2.0
 DEFAULT_MAX_CONCURRENT_CONSUMER_RECEIVES = 16
+DEFAULT_WORKER_PRESENCE_INTERVAL_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +315,7 @@ class Worker:
         worker_revision: Optional[str] = None,
         worker_id: Optional[str] = None,
         revision_poll_interval: float = 1.0,
+        worker_presence_interval: Optional[float] = None,
         on_worker_lost: Any = None,
         default_redelivery_policy: str = "continue",
     ) -> None:
@@ -377,6 +379,18 @@ class Worker:
         self.worker_revision = worker_revision or os.environ.get("FLUXERA_WORKER_REVISION") or "local"
         self.worker_id = worker_id or f"fluxera-worker-{uuid4().hex}"
         self.revision_poll_interval = max(float(revision_poll_interval), 0.05)
+        if worker_presence_interval is None:
+            worker_presence_interval = _env_float(
+                "FLUXERA_WORKER_PRESENCE_INTERVAL_SECONDS",
+                DEFAULT_WORKER_PRESENCE_INTERVAL_SECONDS,
+            )
+        self.worker_presence_interval = max(float(worker_presence_interval), 0.05)
+        presence_ttl = getattr(broker, "worker_presence_ttl_seconds", None)
+        if presence_ttl is not None:
+            self.worker_presence_interval = min(
+                self.worker_presence_interval,
+                max(float(presence_ttl) / 3.0, 0.05),
+            )
         self.default_outcome_callback_targets: dict[str, list[Any]] = {
             "on_worker_lost": self._normalize_callback_targets(on_worker_lost),
         }
@@ -414,6 +428,7 @@ class Worker:
         self.managed_queues: set[str] = set()
         self.queue_states: dict[str, str] = {}
         self.started_at_ms = current_millis()
+        self._next_presence_refresh_at = 0.0
 
         self.metrics_completed_total = 0
         self.metrics_succeeded_total = 0
@@ -476,6 +491,7 @@ class Worker:
             "execution_tasks": len(self.execution_tasks),
             "max_concurrent_consumer_receives": self.max_concurrent_consumer_receives,
             "consumer_idle_backoff_max": self.consumer_idle_backoff_max,
+            "worker_presence_interval": self.worker_presence_interval,
             "completed_total": self.metrics_completed_total,
             "succeeded_total": self.metrics_succeeded_total,
             "failed_total": self.metrics_failed_total,
@@ -501,23 +517,42 @@ class Worker:
         if not self.managed_queues:
             return
 
-        next_states: dict[str, str] = {}
-        for queue_name in sorted(self.managed_queues):
-            if bootstrap:
-                serving_revision = await self.broker.ensure_serving_revision(queue_name, self.worker_revision)
-            else:
-                serving_revision = await self.broker.get_serving_revision(queue_name)
+        if bootstrap:
+            serving_revisions = {
+                queue_name: await self.broker.ensure_serving_revision(
+                    queue_name,
+                    self.worker_revision,
+                )
+                for queue_name in sorted(self.managed_queues)
+            }
+        else:
+            serving_revisions = await self.broker.get_serving_revisions(
+                self.managed_queues,
+            )
+            for queue_name in sorted(self.managed_queues):
+                serving_revision = serving_revisions.get(queue_name)
                 if serving_revision is None:
                     serving_revision = await self.broker.ensure_serving_revision(queue_name, self.worker_revision)
+                    serving_revisions[queue_name] = serving_revision
+
+        next_states: dict[str, str] = {}
+        for queue_name in sorted(self.managed_queues):
+            serving_revision = serving_revisions[queue_name]
             next_states[queue_name] = "accepting" if serving_revision == self.worker_revision else "draining"
 
+        state_changed = next_states != self.queue_states
         self.queue_states = next_states
-        await self.broker.register_worker_revision(
-            worker_id=self.worker_id,
-            worker_revision=self.worker_revision,
-            queue_states=next_states.copy(),
-            runtime_state=self._runtime_state_payload(),
-        )
+        now = time.monotonic()
+        if state_changed:
+            self._next_presence_refresh_at = 0.0
+        if bootstrap or state_changed or now >= self._next_presence_refresh_at:
+            await self.broker.register_worker_revision(
+                worker_id=self.worker_id,
+                worker_revision=self.worker_revision,
+                queue_states=next_states.copy(),
+                runtime_state=self._runtime_state_payload(),
+            )
+            self._next_presence_refresh_at = now + self.worker_presence_interval
 
     async def _run_revision_heartbeat(self) -> None:
         while not self._stopping:
@@ -1528,7 +1563,7 @@ class Worker:
 
         if should_retry:
             retry_delay_ms = self._compute_retry_delay_ms(record, retry_policy)
-            await self.broker.send(
+            await self.broker.send_for_retry(
                 item.delivery.message.copy(
                     options={
                         "attempt": record.attempt + 1,
@@ -1542,7 +1577,7 @@ class Worker:
             record.state = "retry_scheduled"
             record.retry_delay_ms = retry_delay_ms
             record.final_action = "retry"
-            await item.consumer.ack(item.delivery)
+            await item.consumer.ack_for_retry(item.delivery)
             await self._emit_outcome_callbacks(
                 item,
                 record,
@@ -1730,7 +1765,7 @@ class Worker:
         failure_kind: FailureKind,
         defer_ms: int,
     ) -> None:
-        await self.broker.send(
+        await self.broker.send_for_retry(
             item.delivery.message.copy(
                 options={
                     "rate_limit_requeue_timestamp": current_millis(),
@@ -1741,7 +1776,7 @@ class Worker:
         record.state = "retry_scheduled"
         record.retry_delay_ms = defer_ms
         record.final_action = "defer"
-        await item.consumer.ack(item.delivery)
+        await item.consumer.ack_for_retry(item.delivery)
         await self._emit_outcome_callbacks(
             item,
             record,

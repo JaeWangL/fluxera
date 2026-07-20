@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
 
 import orjson
@@ -44,6 +46,51 @@ async def _asgi_get(app, path: str, *, root_path: str = "") -> tuple[int, dict[s
 
 
 class FluxeraAdminASGITests(unittest.IsolatedAsyncioTestCase):
+    async def test_readiness_probe_is_reused_and_closed_by_lifespan(self) -> None:
+        readiness_payload = {
+            "namespace": "unit",
+            "generated_at_ms": 1,
+            "status": "ok",
+            "healthy": True,
+            "redis": {"ping": True, "latency_ms": 1.0},
+        }
+        probe = SimpleNamespace(
+            check=AsyncMock(return_value=readiness_payload),
+            close=AsyncMock(),
+        )
+        app = fluxera.FluxeraAdminASGI(
+            redis_url="redis://unused",
+            namespace="unit",
+            readiness_probe=probe,
+        )
+
+        first_status, _headers, _body = await _asgi_get(app, "/healthz")
+        second_status, _headers, _body = await _asgi_get(app, "/healthz")
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertEqual(probe.check.await_count, 2)
+
+        receive_events = [
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ]
+        sent_messages: list[dict] = []
+
+        async def receive():
+            return receive_events.pop(0)
+
+        async def send(message):
+            sent_messages.append(message)
+
+        await app({"type": "lifespan"}, receive, send)
+
+        self.assertEqual(
+            [message["type"] for message in sent_messages],
+            ["lifespan.startup.complete", "lifespan.shutdown.complete"],
+        )
+        probe.close.assert_awaited_once()
+
     async def test_snapshot_and_dashboard_and_health_endpoints(self) -> None:
         payload = {
             "namespace": "unit",
