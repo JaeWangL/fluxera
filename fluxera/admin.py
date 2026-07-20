@@ -11,6 +11,88 @@ from .dead_letters import DeadLetterRecord
 DEFAULT_REDIS_READINESS_TIMEOUT_SECONDS = 2.0
 
 
+class RedisReadinessProbe:
+    """Reusable Redis readiness client for long-lived admin processes."""
+
+    def __init__(
+        self,
+        redis_url: str,
+        *,
+        namespace: str,
+        timeout_seconds: float = DEFAULT_REDIS_READINESS_TIMEOUT_SECONDS,
+    ) -> None:
+        self.namespace = namespace
+        self.timeout_seconds = max(float(timeout_seconds), 0.001)
+        timeout = self.timeout_seconds
+        self.broker = RedisBroker(
+            redis_url,
+            namespace=namespace,
+            max_connections=4,
+            connection_pool_timeout=min(timeout, 1.0),
+            socket_connect_timeout=min(timeout, 2.0),
+            socket_timeout=timeout,
+            client_name=f"fluxera-admin-readiness:{namespace}",
+        )
+        self._closed = False
+
+    def _payload(
+        self,
+        *,
+        started: float,
+        healthy: bool,
+        error_type: Optional[str],
+    ) -> dict[str, Any]:
+        redis_payload: dict[str, Any] = {
+            "ping": healthy,
+            "latency_ms": round((time.monotonic() - started) * 1000, 3),
+        }
+        if error_type is not None:
+            redis_payload["error_type"] = error_type
+
+        return {
+            "namespace": self.namespace,
+            "generated_at_ms": int(time.time() * 1000),
+            "status": "ok" if healthy else "redis_unreachable",
+            "healthy": healthy,
+            "redis": redis_payload,
+        }
+
+    async def check(self) -> dict[str, Any]:
+        started = time.monotonic()
+        error_type: Optional[str] = None
+        healthy = False
+        try:
+            healthy = bool(
+                await asyncio.wait_for(
+                    self.broker.client.ping(),
+                    timeout=self.timeout_seconds,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness should report failures as data.
+            error_type = type(exc).__name__
+        return self._payload(started=started, healthy=healthy, error_type=error_type)
+
+    def check_sync(self) -> dict[str, Any]:
+        started = time.monotonic()
+        error_type: Optional[str] = None
+        healthy = False
+        try:
+            healthy = bool(self.broker.sync_client.ping())
+        except Exception as exc:  # noqa: BLE001 - readiness should report failures as data.
+            error_type = type(exc).__name__
+        return self._payload(started=started, healthy=healthy, error_type=error_type)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        await self.broker.close()
+        self._closed = True
+
+    def close_sync(self) -> None:
+        self.broker.sync_client.close()
+        self.broker.sync_client.connection_pool.disconnect()
+
+
 @dataclass(slots=True)
 class ServingRevisionStatus:
     namespace: str
@@ -830,7 +912,7 @@ async def get_runtime_status(
             known_queues.update(requested_queues)
 
         worker_rows = await broker.list_worker_runtime_rows(
-            queue_names=requested_queues if requested_queues else None,
+            queue_names=requested_queues or known_queues,
         )
         workers: list[WorkerRuntimeStatus] = []
         queue_names_from_workers: set[str] = set()
@@ -898,11 +980,12 @@ async def get_runtime_status(
             "waiting_not_running": 0,
         }
 
-        for queue_name in queue_list:
-            row = await broker.get_queue_runtime_row(
-                queue_name,
-                pending_idle_threshold_ms=effective_pending_idle_threshold_ms,
-            )
+        queue_rows = await broker.get_queue_runtime_rows(
+            queue_list,
+            pending_idle_threshold_ms=effective_pending_idle_threshold_ms,
+            include_worker_ids=False,
+        )
+        for queue_name, row in zip(queue_list, queue_rows):
 
             stream_ready = int(row["stream_length"])
             delayed = int(row["delayed_count"])
@@ -980,45 +1063,26 @@ async def get_redis_readiness(
     namespace: str,
     timeout_seconds: float = DEFAULT_REDIS_READINESS_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
-    timeout = max(float(timeout_seconds), 0.001)
-    started = time.monotonic()
-    broker = RedisBroker(
+    payload: Optional[dict[str, Any]] = None
+    probe = RedisReadinessProbe(
         redis_url,
         namespace=namespace,
-        max_connections=4,
-        connection_pool_timeout=min(timeout, 1.0),
-        socket_connect_timeout=min(timeout, 2.0),
-        socket_timeout=timeout,
-        client_name=f"fluxera-admin-readiness:{namespace}",
+        timeout_seconds=timeout_seconds,
     )
-    error_type: Optional[str] = None
-    healthy = False
     try:
-        healthy = bool(await asyncio.wait_for(broker.client.ping(), timeout=timeout))
-    except Exception as exc:  # noqa: BLE001 - readiness should report failures as data.
-        error_type = type(exc).__name__
+        payload = await probe.check()
     finally:
         try:
-            await broker.close()
+            await probe.close()
         except Exception:
-            if healthy:
-                error_type = "RedisCloseError"
-                healthy = False
-
-    redis_payload: dict[str, Any] = {
-        "ping": healthy,
-        "latency_ms": round((time.monotonic() - started) * 1000, 3),
-    }
-    if error_type is not None:
-        redis_payload["error_type"] = error_type
-
-    return {
-        "namespace": namespace,
-        "generated_at_ms": int(time.time() * 1000),
-        "status": "ok" if healthy else "redis_unreachable",
-        "healthy": healthy,
-        "redis": redis_payload,
-    }
+            if payload is not None and payload["healthy"]:
+                payload["healthy"] = False
+                payload["status"] = "redis_unreachable"
+                payload["redis"]["ping"] = False
+                payload["redis"]["error_type"] = "RedisCloseError"
+    if payload is None:  # pragma: no cover - check() either returns or propagates.
+        raise RuntimeError("Redis readiness probe did not return a payload.")
+    return payload
 
 
 async def get_runtime_health(

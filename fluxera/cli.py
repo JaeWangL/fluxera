@@ -179,6 +179,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=3.0,
         help="Dashboard auto-refresh interval.",
     )
+    monitor_serve_parser.add_argument(
+        "--snapshot-cache-seconds",
+        type=float,
+        default=25.0,
+        help="Standalone admin snapshot cache duration.",
+    )
     monitor_serve_parser.set_defaults(handler=_handle_monitor_serve)
 
     worker_parser = subparsers.add_parser("worker", help="Run a Fluxera worker from imported modules.")
@@ -271,7 +277,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--revision-poll-interval",
         type=float,
         default=_float_env("FLUXERA_REVISION_POLL_INTERVAL"),
-        help="Revision heartbeat interval in seconds.",
+        help="Serving revision poll interval in seconds.",
+    )
+    worker_parser.add_argument(
+        "--worker-presence-interval",
+        type=float,
+        default=_float_env("FLUXERA_WORKER_PRESENCE_INTERVAL_SECONDS"),
+        help="Worker presence publication interval in seconds.",
     )
     worker_parser.add_argument(
         "--uvloop",
@@ -584,6 +596,8 @@ def _build_worker(args: argparse.Namespace, broker: Broker) -> Worker:
         worker_kwargs["worker_id"] = args.worker_id
     if args.revision_poll_interval is not None:
         worker_kwargs["revision_poll_interval"] = args.revision_poll_interval
+    if args.worker_presence_interval is not None:
+        worker_kwargs["worker_presence_interval"] = args.worker_presence_interval
     return Worker(broker, **worker_kwargs)
 
 
@@ -839,6 +853,7 @@ async def _handle_monitor_serve(args: argparse.Namespace) -> int:
         worker_stale_after_ms=args.worker_stale_after_ms,
         pending_idle_threshold_ms=args.pending_idle_threshold_ms,
         refresh_seconds=args.refresh_seconds,
+        snapshot_cache_seconds=args.snapshot_cache_seconds,
     )
     server.start()
     print(f"admin_url=http://{args.host}:{server.port}/admin")

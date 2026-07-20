@@ -156,9 +156,11 @@ class RedisLuaScripts:
     def __init__(self, client) -> None:
         self.client = client
         self._scripts = {
+            "acknowledge_delivery": self.client.register_script(self._load("acknowledge_delivery.lua")),
             "enqueue_or_deduplicate": self.client.register_script(self._load("enqueue_or_deduplicate.lua")),
             "promote_due": self.client.register_script(self._load("promote_due.lua")),
             "remove_dedupe_key_if_owner": self.client.register_script(self._load("remove_dedupe_key_if_owner.lua")),
+            "remove_stale_queue": self.client.register_script(self._load("remove_stale_queue.lua")),
             "idem_begin": self.client.register_script(self._load("idem_begin.lua")),
             "idem_heartbeat": self.client.register_script(self._load("idem_heartbeat.lua")),
             "idem_commit": self.client.register_script(self._load("idem_commit.lua")),
@@ -172,9 +174,12 @@ class RedisLuaScripts:
         self,
         *,
         message_key_prefix: str,
+        message_ref_key_prefix: str,
         stream_key: str,
         delayed_key: str,
         dedupe_key: str,
+        queue_registry_key: str,
+        queue_name: str,
         message_id: str,
         encoded_message: bytes,
         now_ms: int,
@@ -186,7 +191,14 @@ class RedisLuaScripts:
         message_ttl_ms: int,
     ) -> EnqueueDecision:
         response = await self._scripts["enqueue_or_deduplicate"](
-            keys=[message_key_prefix, stream_key, delayed_key, dedupe_key],
+            keys=[
+                message_key_prefix,
+                stream_key,
+                delayed_key,
+                dedupe_key,
+                queue_registry_key,
+                message_ref_key_prefix,
+            ],
             args=[
                 message_id,
                 encoded_message,
@@ -197,6 +209,7 @@ class RedisLuaScripts:
                 1 if extend else 0,
                 1 if replace else 0,
                 message_ttl_ms,
+                queue_name,
             ],
         )
         return EnqueueDecision.from_response(response)
@@ -205,9 +218,12 @@ class RedisLuaScripts:
         self,
         *,
         message_key_prefix: str,
+        message_ref_key_prefix: str,
         stream_key: str,
         delayed_key: str,
         dedupe_key: str,
+        queue_registry_key: str,
+        queue_name: str,
         message_id: str,
         encoded_message: bytes,
         now_ms: int,
@@ -219,7 +235,14 @@ class RedisLuaScripts:
         message_ttl_ms: int,
     ) -> EnqueueDecision:
         response = self._scripts["enqueue_or_deduplicate"](
-            keys=[message_key_prefix, stream_key, delayed_key, dedupe_key],
+            keys=[
+                message_key_prefix,
+                stream_key,
+                delayed_key,
+                dedupe_key,
+                queue_registry_key,
+                message_ref_key_prefix,
+            ],
             args=[
                 message_id,
                 encoded_message,
@@ -230,9 +253,26 @@ class RedisLuaScripts:
                 1 if extend else 0,
                 1 if replace else 0,
                 message_ttl_ms,
+                queue_name,
             ],
         )
         return EnqueueDecision.from_response(response)
+
+    async def acknowledge_delivery(
+        self,
+        *,
+        stream_key: str,
+        payload_key: str,
+        payload_ref_key: str,
+        group_name: str,
+        transport_id: str,
+        client=None,
+    ):
+        return await self._scripts["acknowledge_delivery"](
+            keys=[stream_key, payload_key, payload_ref_key],
+            args=[group_name, transport_id],
+            client=client,
+        )
 
     async def promote_due(
         self,
@@ -252,6 +292,19 @@ class RedisLuaScripts:
         response = await self._scripts["remove_dedupe_key_if_owner"](
             keys=[dedupe_key],
             args=[message_id],
+        )
+        return bool(_decode_int(response))
+
+    async def remove_stale_queue(
+        self,
+        *,
+        registry_key: str,
+        queue_name: str,
+        runtime_keys: list[str],
+    ) -> bool:
+        response = await self._scripts["remove_stale_queue"](
+            keys=[registry_key, *runtime_keys],
+            args=[queue_name],
         )
         return bool(_decode_int(response))
 

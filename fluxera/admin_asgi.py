@@ -10,7 +10,7 @@ from urllib.parse import parse_qs
 
 import orjson
 
-from .admin import get_redis_readiness, get_runtime_status, runtime_status_to_dict
+from .admin import RedisReadinessProbe, get_runtime_status, runtime_status_to_dict
 
 Headers = list[tuple[bytes, bytes]]
 SnapshotLoader = Callable[[dict[str, list[str]]], Awaitable[dict[str, Any]]]
@@ -241,6 +241,7 @@ class FluxeraAdminASGI:
         refresh_seconds: float = 3.0,
         snapshot_loader: Optional[SnapshotLoader] = None,
         readiness_loader: Optional[ReadinessLoader] = None,
+        readiness_probe: Optional[RedisReadinessProbe] = None,
         snapshot_timeout_seconds: float = DEFAULT_SNAPSHOT_TIMEOUT_SECONDS,
         snapshot_cache_seconds: float = DEFAULT_SNAPSHOT_CACHE_SECONDS,
         readiness_timeout_seconds: float = DEFAULT_READINESS_TIMEOUT_SECONDS,
@@ -254,6 +255,16 @@ class FluxeraAdminASGI:
         self.refresh_seconds = refresh_seconds
         self.snapshot_loader = snapshot_loader
         self.readiness_loader = readiness_loader
+        self._readiness_probe = (
+            None
+            if readiness_loader is not None
+            else readiness_probe
+            or RedisReadinessProbe(
+                redis_url,
+                namespace=namespace,
+                timeout_seconds=readiness_timeout_seconds,
+            )
+        )
         self.snapshot_timeout_seconds = max(float(snapshot_timeout_seconds), 0.001)
         self.snapshot_cache_seconds = max(float(snapshot_cache_seconds), 0.0)
         self.readiness_timeout_seconds = max(float(readiness_timeout_seconds), 0.001)
@@ -362,11 +373,33 @@ class FluxeraAdminASGI:
                 self.readiness_loader(),
                 timeout=self.readiness_timeout_seconds,
             )
-        return await get_redis_readiness(
-            self.redis_url,
-            namespace=self.namespace,
-            timeout_seconds=self.readiness_timeout_seconds,
-        )
+        if self._readiness_probe is None:  # pragma: no cover - constructor invariant
+            raise RuntimeError("Redis readiness probe is not configured.")
+        return await self._readiness_probe.check()
+
+    async def aclose(self) -> None:
+        if self._readiness_probe is not None:
+            await self._readiness_probe.close()
+
+    async def _handle_lifespan(self, receive, send) -> None:
+        while True:
+            event = await receive()
+            if event["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+                continue
+            if event["type"] == "lifespan.shutdown":
+                try:
+                    await self.aclose()
+                except Exception as exc:  # pragma: no cover - server integration path
+                    await send(
+                        {
+                            "type": "lifespan.shutdown.failed",
+                            "message": str(exc),
+                        }
+                    )
+                else:
+                    await send({"type": "lifespan.shutdown.complete"})
+                return
 
     def _snapshot_error_payload(self, exc: Exception) -> dict[str, Any]:
         return {
@@ -418,6 +451,10 @@ class FluxeraAdminASGI:
         )
 
     async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "lifespan":
+            await self._handle_lifespan(receive, send)
+            return
+
         if scope["type"] != "http":
             await self._send(
                 send,

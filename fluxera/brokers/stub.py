@@ -66,6 +66,15 @@ class StubBroker(Broker):
     async def get_serving_revision(self, queue_name: str) -> Optional[str]:
         return self.serving_revisions.get(queue_name)
 
+    async def get_serving_revisions(
+        self,
+        queue_names: set[str],
+    ) -> dict[str, Optional[str]]:
+        return {
+            queue_name: self.serving_revisions.get(queue_name)
+            for queue_name in sorted(queue_names)
+        }
+
     async def promote_serving_revision(
         self,
         queue_name: str,

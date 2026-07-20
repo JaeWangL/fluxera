@@ -100,6 +100,7 @@ The RedisBroker revision control plane uses these keys:
 - `namespace:serving_revision:{queue}` -> current serving revision for a queue
 - `namespace:worker:{worker_id}` -> worker heartbeat hash
 - `namespace:workers:{queue}` -> zset of worker ids by last-seen timestamp
+- `namespace:registry:queues` -> queues known to the runtime and admin plane
 
 Current worker hash fields:
 
@@ -130,13 +131,14 @@ Bootstrap rule:
 
 ### 6.2 Steady state
 
-Each worker polls the broker periodically.
+Each worker polls all managed `serving_revision` values in one batched read.
+The local queue state is recalculated on every revision poll. Worker presence
+is published on a separate, slower interval, but an `accepting`/`draining`
+transition is published immediately.
 
-For every managed queue it refreshes:
-
-- current `serving_revision`
-- local queue state
-- worker heartbeat
+The default presence interval is `5s` and is automatically capped at one third
+of `worker_presence_ttl_seconds`. A failed state-change publication remains
+pending and is retried on the next revision poll.
 
 ### 6.3 When a worker is `accepting`
 
@@ -243,6 +245,7 @@ In other words:
 - `worker_revision`
 - `worker_id`
 - `revision_poll_interval`
+- `worker_presence_interval`
 
 If `worker_revision` is omitted, Fluxera reads:
 
@@ -254,12 +257,21 @@ and falls back to `"local"` only when nothing is provided.
 
 The `"local"` fallback exists for development convenience, not as a production rollout strategy.
 
+If `worker_presence_interval` is omitted, Fluxera reads:
+
+```bash
+FLUXERA_WORKER_PRESENCE_INTERVAL_SECONDS
+```
+
+and otherwise defaults to `5s`.
+
 ### RedisBroker
 
 The Redis broker currently exposes:
 
 - `ensure_serving_revision(queue_name, worker_revision)`
 - `get_serving_revision(queue_name)`
+- `get_serving_revisions(queue_names)`
 - `promote_serving_revision(queue_name, revision, expected_revision=None)`
 - `register_worker_revision(worker_id, worker_revision, queue_states)`
 - `unregister_worker_revision(worker_id, queue_names)`
@@ -302,6 +314,7 @@ worker = fluxera.Worker(
     broker,
     worker_revision=os.environ["FLUXERA_WORKER_REVISION"],
     revision_poll_interval=0.5,
+    worker_presence_interval=5.0,
 )
 ```
 

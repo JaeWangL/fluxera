@@ -51,6 +51,10 @@ class Consumer(ABC):
     async def ack(self, delivery: Delivery) -> None:
         raise NotImplementedError
 
+    async def ack_for_retry(self, delivery: Delivery) -> None:
+        """Acknowledge a consumed attempt while preserving retry ownership."""
+        await self.ack(delivery)
+
     @abstractmethod
     async def reject(self, delivery: Delivery, *, requeue: bool = False) -> None:
         raise NotImplementedError
@@ -97,6 +101,15 @@ class Broker(ABC):
     @abstractmethod
     async def send(self, message: Message, *, delay: Optional[float] = None) -> Message:
         raise NotImplementedError
+
+    async def send_for_retry(
+        self,
+        message: Message,
+        *,
+        delay: Optional[float] = None,
+    ) -> Message:
+        """Enqueue an internally retried message."""
+        return await self.send(message, delay=delay)
 
     @abstractmethod
     async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> Consumer:
@@ -147,6 +160,15 @@ class Broker(ABC):
     async def get_serving_revision(self, queue_name: str) -> Optional[str]:
         del queue_name
         return None
+
+    async def get_serving_revisions(
+        self,
+        queue_names: set[str],
+    ) -> dict[str, Optional[str]]:
+        revisions: dict[str, Optional[str]] = {}
+        for queue_name in sorted(queue_names):
+            revisions[queue_name] = await self.get_serving_revision(queue_name)
+        return revisions
 
     async def promote_serving_revision(
         self,

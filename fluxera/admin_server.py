@@ -4,16 +4,72 @@ import asyncio
 import html
 import logging
 import threading
+import time
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
 import orjson
 
-from .admin import get_redis_readiness, get_runtime_status, runtime_status_to_dict
+from .admin import RedisReadinessProbe, get_runtime_status, runtime_status_to_dict
 
 logger = logging.getLogger(__name__)
+DEFAULT_SNAPSHOT_CACHE_SECONDS = 25.0
+
+
+@dataclass(slots=True)
+class _RuntimeSnapshotCacheEntry:
+    payload: dict
+    cached_at_monotonic: float
+    cached_at_ms: int
+
+
+class _RuntimeSnapshotCache:
+    def __init__(self, ttl_seconds: float) -> None:
+        self.ttl_seconds = max(float(ttl_seconds), 0.0)
+        self._entries: dict[
+            Optional[tuple[str, ...]],
+            _RuntimeSnapshotCacheEntry,
+        ] = {}
+        self._lock = threading.Lock()
+
+    def get_or_load(
+        self,
+        key: Optional[tuple[str, ...]],
+        loader: Callable[[], dict],
+    ) -> dict:
+        with self._lock:
+            now = time.monotonic()
+            entry = self._entries.get(key)
+            if (
+                entry is not None
+                and self.ttl_seconds > 0
+                and now - entry.cached_at_monotonic <= self.ttl_seconds
+            ):
+                payload = dict(entry.payload)
+                payload["snapshot_cache"] = {
+                    "state": "hit",
+                    "cached_at_ms": entry.cached_at_ms,
+                    "ttl_seconds": self.ttl_seconds,
+                }
+                return payload
+
+            payload = loader()
+            cached_at_ms = int(time.time() * 1000)
+            self._entries[key] = _RuntimeSnapshotCacheEntry(
+                payload=dict(payload),
+                cached_at_monotonic=time.monotonic(),
+                cached_at_ms=cached_at_ms,
+            )
+            response_payload = dict(payload)
+            response_payload["snapshot_cache"] = {
+                "state": "refresh",
+                "cached_at_ms": cached_at_ms,
+                "ttl_seconds": self.ttl_seconds,
+            }
+            return response_payload
 
 
 def _dashboard_html(refresh_seconds: float) -> str:
@@ -175,6 +231,8 @@ class _AdminDashboardHandler(BaseHTTPRequestHandler):
     pending_idle_threshold_ms: Optional[int] = None
     refresh_seconds: float = 3.0
     readiness_timeout_seconds: float = 2.0
+    readiness_probe: RedisReadinessProbe
+    snapshot_cache: _RuntimeSnapshotCache
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003 - stdlib method name
         logger.info("fluxera-admin %s - %s", self.address_string(), format % args)
@@ -203,7 +261,7 @@ class _AdminDashboardHandler(BaseHTTPRequestHandler):
             return [queue for queue in query_queues if queue]
         return self.queue_filter
 
-    def _load_runtime_payload(self, *, queues: Optional[list[str]]) -> dict:
+    def _load_runtime_payload_uncached(self, *, queues: Optional[list[str]]) -> dict:
         status = asyncio.run(
             get_runtime_status(
                 self.redis_url,
@@ -217,14 +275,19 @@ class _AdminDashboardHandler(BaseHTTPRequestHandler):
         payload["healthy"] = status.overall_status == "ok"
         return payload
 
-    def _load_readiness_payload(self) -> dict:
-        return asyncio.run(
-            get_redis_readiness(
-                self.redis_url,
-                namespace=self.namespace,
-                timeout_seconds=self.readiness_timeout_seconds,
-            )
+    def _load_runtime_payload(self, *, queues: Optional[list[str]]) -> dict:
+        cache_key = (
+            None
+            if queues is None
+            else tuple(sorted({queue for queue in queues if queue}))
         )
+        return self.snapshot_cache.get_or_load(
+            cache_key,
+            lambda: self._load_runtime_payload_uncached(queues=queues),
+        )
+
+    def _load_readiness_payload(self) -> dict:
+        return self.readiness_probe.check_sync()
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
@@ -267,7 +330,14 @@ class AdminDashboardServer:
         pending_idle_threshold_ms: Optional[int] = None,
         refresh_seconds: float = 3.0,
         readiness_timeout_seconds: float = 2.0,
+        snapshot_cache_seconds: float = DEFAULT_SNAPSHOT_CACHE_SECONDS,
     ) -> None:
+        self._readiness_probe = RedisReadinessProbe(
+            redis_url,
+            namespace=namespace,
+            timeout_seconds=readiness_timeout_seconds,
+        )
+        self._snapshot_cache = _RuntimeSnapshotCache(snapshot_cache_seconds)
         handler = type(
             "FluxeraAdminHandler",
             (_AdminDashboardHandler,),
@@ -279,6 +349,8 @@ class AdminDashboardServer:
                 "pending_idle_threshold_ms": pending_idle_threshold_ms,
                 "refresh_seconds": refresh_seconds,
                 "readiness_timeout_seconds": readiness_timeout_seconds,
+                "readiness_probe": self._readiness_probe,
+                "snapshot_cache": self._snapshot_cache,
             },
         )
         self._server = ThreadingHTTPServer((host, port), handler)
@@ -308,3 +380,4 @@ class AdminDashboardServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        self._readiness_probe.close_sync()
