@@ -1339,6 +1339,46 @@ class RedisBrokerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(attempts), 1)
 
+    async def test_long_task_spanning_many_lease_windows_survives_competing_worker(self) -> None:
+        # 1시간짜리 태스크의 스케일 축소 불변식: 태스크가 리스 윈도우를 수십 번
+        # 넘겨도(여기서는 0.2s 리스 x 5s 태스크 = 25 윈도우) 리스 갱신 하트비트가
+        # 소유권을 유지해, 경쟁 워커가 있어도 정확히 1회만 실행되어야 한다.
+        # 실제 1시간 태스크는 이 불변식의 시간 축 확장이다.
+        broker1 = self.make_broker(lease_seconds=0.2, consumer_name_prefix="long-a")
+        broker2 = self.make_broker(lease_seconds=0.2, consumer_name_prefix="long-b")
+        attempts: list[int] = []
+        finished = asyncio.Event()
+
+        async def very_long() -> None:
+            attempts.append(len(attempts))
+            await asyncio.sleep(5.0)
+            finished.set()
+
+        actor1 = fluxera.actor(
+            broker=broker1,
+            actor_name="very_long",
+            queue_name="default",
+        )(very_long)
+        fluxera.actor(
+            broker=broker2,
+            actor_name="very_long",
+            queue_name="default",
+        )(very_long)
+
+        worker1 = fluxera.Worker(broker1, concurrency=1)
+        worker2 = fluxera.Worker(broker2, concurrency=1)
+        await worker1.start()
+        await worker2.start()
+        try:
+            await actor1.send()
+            await asyncio.wait_for(finished.wait(), timeout=15.0)
+            await asyncio.wait_for(broker1.join(actor1.queue_name), timeout=10.0)
+        finally:
+            await worker1.stop()
+            await worker2.stop()
+
+        self.assertEqual(len(attempts), 1)
+
     async def test_lease_extensions_are_batched_without_incrementing_delivery_count(self) -> None:
         broker = self.make_broker(
             lease_seconds=1.0,
