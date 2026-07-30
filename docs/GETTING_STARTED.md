@@ -484,6 +484,11 @@ fluxera rate-limit run \
 
 ## Deduplication And Idempotency
 
+Deduplication and the idempotency store are **RedisBroker-only**: both need a
+shared KV store. `RabbitMQBroker` rejects sends carrying `deduplication`/`job_id`
+options with `ValueError`, and `StubBroker` ignores them. See the Broker Feature
+Matrix in the README and `docs/RABBITMQ_PARITY.md` for details.
+
 Fluxera separates three ideas:
 
 - transport delivery is at-least-once

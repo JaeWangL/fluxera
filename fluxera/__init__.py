@@ -38,6 +38,15 @@ from .errors import RateLimitExceeded
 from .brokers.redis import RedisBroker
 from .brokers.stub import StubBroker
 from .message import Message
+
+
+def __getattr__(name: str):
+    if name == "RabbitMQBroker":
+        from .brokers.rabbitmq import RabbitMQBroker
+
+        return RabbitMQBroker
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 from .rate_limits import ConcurrentRateLimiter
 from .runtime.worker import TaskRecord, Worker
 
@@ -57,6 +66,7 @@ __all__ = [
     "Message",
     "OutcomeContext",
     "PickleMessageEncoder",
+    "RabbitMQBroker",
     "RateLimitExceeded",
     "RedisBroker",
     "RedisReadinessProbe",

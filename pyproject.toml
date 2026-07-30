@@ -8,7 +8,7 @@ version = "0.3.0"
 description = "Async-native message processing inspired by Dramatiq."
 readme = "README.md"
 requires-python = ">=3.10"
-keywords = ["asyncio", "dramatiq", "message-queue", "redis", "worker"]
+keywords = ["asyncio", "dramatiq", "message-queue", "rabbitmq", "redis", "worker"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: AsyncIO",
@@ -34,6 +34,9 @@ fluxera = "fluxera.cli:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+rabbitmq = [
+    "aio-pika>=9.5,<10",
 ]
 
 [tool.pytest.ini_options]

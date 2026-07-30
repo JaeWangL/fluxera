@@ -4,6 +4,13 @@ Status: Draft v0.1
 
 Last Updated: 2026-03-28
 
+> **Broker support**: everything in this document is implemented on
+> `RedisBroker` only — both layers require a shared KV store.
+> `RabbitMQBroker` rejects deduplicated sends with `ValueError` and has no
+> idempotency store; `StubBroker` ignores deduplication options. See the
+> Broker Feature Matrix in the README and [RABBITMQ_PARITY.md](RABBITMQ_PARITY.md)
+> for the investigation into why RabbitMQ cannot express these semantics.
+
 ## 1. Purpose
 
 Fluxera already provides at-least-once delivery and ack-late processing. This document defines two optional policy layers that sit above those transport guarantees:

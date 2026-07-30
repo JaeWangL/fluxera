@@ -33,6 +33,12 @@ Redis transport comparison:
 python3 benchmarks/redis_transport_compare.py --repeat 5 --long-io-secs 1.5
 ```
 
+Broker transport comparison (RedisBroker vs RabbitMQBroker):
+
+```bash
+python3 benchmarks/broker_transport_compare.py --repeat 3
+```
+
 Verification suite:
 
 ```bash
@@ -190,6 +196,42 @@ Takeaway:
 
 - The reclaim path itself is efficient enough for the current alpha design.
 - This scenario is transport-internal, so it is not compared directly to Dramatiq.
+
+## Broker Transport Results (Redis vs RabbitMQ)
+
+Measured on `2026-07-31` with `benchmarks/broker_transport_compare.py --repeat 3`
+against local Docker containers (`redis:7.4-alpine`, `rabbitmq:4.0-management-alpine`
+with `collect_statistics_interval 500`). Completion is detected with in-process
+counters so per-broker `join()` implementation differences do not skew wall time.
+
+| Scenario | RedisBroker | RabbitMQBroker | Ratio (rabbitmq/redis) |
+| --- | ---: | ---: | ---: |
+| enqueue-only, sequential (2000 msgs) | `4704 msg/s` | `1648 msg/s` | `2.86x` wall |
+| enqueue-concurrent (2000 msgs, gather x100) | `7279 msg/s` | `4645 msg/s` | `1.60x` wall |
+| fanout end-to-end (240 msgs, c=256) | `1541 msg/s` | `893 msg/s` | `1.75x` wall |
+| mixed long/short (c=96) | `wall=2.019s`, `short_drain=0.067s` | `wall=2.05-2.11s`, `short_drain=0.10-0.24s` | `~1.04x` wall, `1.5-3.5x` short drain |
+
+Enqueue notes:
+
+- RabbitMQ sequential enqueue is bounded by one publisher-confirm round trip
+  (with fsync durability) per message, and varies between runs with the
+  container's fsync batching. Concurrent sends overlap their confirm waits on
+  one channel, recovering most of the gap while keeping full durability.
+- `RabbitMQBroker(publisher_confirms=False)` (fire-and-forget) measured
+  ~17,000 msg/s raw locally — faster than Redis — at the cost of possible loss
+  of unconfirmed publishes on broker crash. Redis enqueue itself is not
+  crash-durable beyond its AOF policy (up to ~1s of acknowledged sends can be
+  lost with `appendfsync everysec`), so the durability-per-msg/s trade-offs
+  differ at a more fundamental level than the headline numbers suggest.
+
+Takeaway:
+
+- RabbitMQ enqueue is bounded by per-publish publisher confirms; Redis batches its
+  enqueue through a single Lua script call.
+- For workloads dominated by actual actor work (mixed long/short), the transports
+  are equivalent on wall time.
+- Short-message drain latency is higher on RabbitMQ because prefetched deliveries
+  are buffered per consumer instead of being pulled on demand.
 
 ## Async-Native Check
 

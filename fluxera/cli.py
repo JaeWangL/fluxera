@@ -286,6 +286,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Worker presence publication interval in seconds.",
     )
     worker_parser.add_argument(
+        "--stop-timeout",
+        type=float,
+        default=_float_env("FLUXERA_STOP_TIMEOUT_SECONDS"),
+        help=(
+            "Seconds to let in-flight tasks finish during shutdown before they are "
+            "cancelled and requeued. Set at least your worst-case task duration for "
+            "stop-then-start deploys. Defaults to the Worker default (30s)."
+        ),
+    )
+    worker_parser.add_argument(
         "--uvloop",
         action="store_true",
         default=_bool_env("FLUXERA_USE_UVLOOP"),
@@ -928,7 +938,10 @@ async def _handle_worker(args: argparse.Namespace) -> int:
         await _wait_for_stop_signal()
         return 0
     finally:
-        await worker.stop()
+        if args.stop_timeout is None:
+            await worker.stop()
+        else:
+            await worker.stop(timeout=args.stop_timeout)
 
 
 async def _run(args: argparse.Namespace) -> int:

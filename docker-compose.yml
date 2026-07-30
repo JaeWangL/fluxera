@@ -9,3 +9,19 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+  rabbitmq:
+    image: rabbitmq:4.0-management-alpine
+    container_name: fluxera-rabbitmq
+    environment:
+      # join/진단이 사용하는 management API가 unacked 수를 빠르게 반영하도록
+      # 큐 통계 수집 주기를 짧게 설정한다. 기본값은 5000ms.
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit collect_statistics_interval 500"
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

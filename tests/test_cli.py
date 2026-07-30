@@ -166,6 +166,17 @@ class FluxeraCliTests(unittest.TestCase):
             self.assertFalse(marker_path.exists())
             self.assertIn("busy:", stderr.getvalue())
 
+    def test_worker_parser_accepts_stop_timeout(self) -> None:
+        # stop-then-start 배포에서 장시간 태스크가 취소·재큐잉되지 않고 완주할 수
+        # 있도록, 워커 종료 드레인 시간을 CLI에서 지정할 수 있어야 한다.
+        from fluxera.cli import build_parser
+
+        args = build_parser().parse_args(["worker", "--stop-timeout", "3600"])
+        self.assertEqual(args.stop_timeout, 3600.0)
+
+        default_args = build_parser().parse_args(["worker"])
+        self.assertIsNone(default_args.stop_timeout)
+
     def test_worker_command_runs_stub_broker_app_from_module_registry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             package_dir = Path(temp_dir) / "cli_worker_app"
