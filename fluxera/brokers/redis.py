@@ -14,7 +14,7 @@ from redis.exceptions import ResponseError, WatchError
 from ..broker import Broker, Consumer, Delivery
 from ..dead_letters import DeadLetterRecord, coerce_dead_letter_record
 from ..encoder import JSONMessageEncoder, MessageEncoder
-from ..errors import QueueNotFound
+from ..errors import DeliveryOwnershipLost, QueueNotFound
 from ..message import Message
 from .redis_scripts import RedisLuaScripts
 
@@ -1028,6 +1028,11 @@ class RedisBroker(Broker):
         self._registered_runtime_queues.add(message.queue_name)
         return message
 
+    async def retry_delivery(self, consumer, delivery, message, *, delay=None):
+        if not isinstance(consumer, _RedisConsumer) or consumer.broker is not self:
+            raise ValueError("Retry must use the delivery's Redis consumer")
+        await consumer._settle(delivery, mode="retry", retry_message=message, delay=delay)
+
     async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> Consumer:
         self.declare_queue(queue_name)
         await self._ensure_group(queue_name)
@@ -1236,6 +1241,7 @@ class _RedisConsumer(Consumer):
         self.dead_letter_key = broker._dead_letter_key(queue_name)
         self.claim_cursor = "0-0"
         self.active_ids: set[str] = set()
+        self._active_generations: dict[str, int] = {}
         self._closed = False
         self._next_promote_due_at = 0.0
         self._next_stale_claim_at = 0.0
@@ -1260,7 +1266,7 @@ class _RedisConsumer(Consumer):
             return delivery.message_id
         return _decode_message_id(message_id)
 
-    async def _build_deliveries(self, entries, *, redelivered: bool) -> list[Delivery]:
+    async def _build_deliveries(self, entries, *, redelivered: bool, generations=None) -> list[Delivery]:
         if not entries:
             return []
 
@@ -1269,8 +1275,10 @@ class _RedisConsumer(Consumer):
 
         deliveries: list[Delivery] = []
         dead_letter_records: list[DeadLetterRecord] = []
+        generations = generations or {}
         for (entry_id, _fields), message_id, payload in zip(entries, message_ids, payloads):
             transport_id = _decode_stream_id(entry_id)
+            generation = generations.get(transport_id, 1)
             if payload is None:
                 now_ms = int(time.time() * 1000)
                 dead_letter_records.append(
@@ -1326,6 +1334,7 @@ class _RedisConsumer(Consumer):
                 metadata={
                     "queue_name": self.queue_name,
                     "consumer_name": self.consumer_name,
+                    "redis_delivery_generation": generation,
                     "lease_seconds": self.broker.lease_seconds,
                     "message_id": message_id,
                     "message_key": self.broker._message_key(message_id),
@@ -1334,36 +1343,30 @@ class _RedisConsumer(Consumer):
             )
             deliveries.append(delivery)
             self.active_ids.add(transport_id)
+            self._active_generations[transport_id] = generation
 
-        if dead_letter_records:
-            now_ms = int(time.time() * 1000)
-            pipe = self.broker.client.pipeline()
-            for record in dead_letter_records:
-                self.broker._queue_dead_letter_record_commands(pipe, record, now_ms=now_ms)
-                transport_id = record.delivery_id
-                if transport_id is None:
-                    continue
-                await self.broker.scripts.acknowledge_delivery(
-                    stream_key=self.stream_key,
-                    payload_key=self.broker._message_key(record.message_id),
-                    payload_ref_key=self.broker._message_ref_key(record.message_id),
-                    group_name=self.broker.group_name,
-                    transport_id=transport_id,
-                    client=pipe,
-                )
-            await pipe.execute()
+        for record in dead_letter_records:
+            # Integrity failures have no decoded Message but still own a PEL
+            # acquisition. Its DLQ write and removal use the same fence.
+            delivery = Delivery(
+                message=Message(queue_name=self.queue_name, actor_name="<unknown>", message_id=record.message_id),
+                transport_id=record.delivery_id,
+                metadata={"redis_delivery_generation": generations.get(record.delivery_id, 1)},
+            )
+            try:
+                await self._settle(delivery, mode="reject", dead_letter_record=record)
+            except DeliveryOwnershipLost:
+                pass  # A newer receiver is responsible for the integrity failure.
 
         return deliveries
 
     async def _claim_stale(self, *, limit: int) -> list[Delivery]:
         try:
-            cursor, entries, _ = await self.broker.client.xautoclaim(
-                self.stream_key,
-                self.broker.group_name,
-                self.consumer_name,
-                self.lease_ms,
-                self.claim_cursor,
-                count=max(limit, self.broker.pending_scan_size),
+            cursor, acquired = await self.broker.scripts.claim_deliveries(
+                stream_key=self.stream_key, group_name=self.broker.group_name,
+                consumer_name=self.consumer_name, lease_ms=self.lease_ms,
+                cursor=self.claim_cursor, limit=limit,
+                scan_size=max(limit, self.broker.pending_scan_size), active_ids=sorted(self.active_ids),
             )
         except ResponseError as exc:
             if _is_missing_group_error(exc):
@@ -1373,16 +1376,15 @@ class _RedisConsumer(Consumer):
             raise
 
         self.claim_cursor = _decode_stream_id(cursor)
-        filtered_entries = []
-        for entry_id, fields in entries:
+        entries = []
+        generations = {}
+        for entry_id, fields, generation in acquired:
             transport_id = _decode_stream_id(entry_id)
-            if transport_id in self.active_ids:
-                continue
-            filtered_entries.append((entry_id, fields))
-            if len(filtered_entries) >= limit:
-                break
-
-        return await self._build_deliveries(filtered_entries, redelivered=True)
+            # A new acquisition is never mistaken for an older in-flight task,
+            # even if this same consumer has acquired the entry again (ABA).
+            entries.append((entry_id, dict(zip(fields[::2], fields[1::2]))))
+            generations[transport_id] = int(generation)
+        return await self._build_deliveries(entries, redelivered=True, generations=generations)
 
     async def _promote_due_if_due(self, *, limit: int) -> None:
         interval = self.broker.promote_due_interval_seconds
@@ -1432,81 +1434,97 @@ class _RedisConsumer(Consumer):
         _, entries = response[0]
         return await self._build_deliveries(entries, redelivered=False)
 
-    async def ack(self, delivery: Delivery) -> None:
-        await self._acknowledge_delivery(
-            delivery,
-            release_deduplication=True,
+    def _generation(self, delivery):
+        generation = delivery.metadata.get("redis_delivery_generation")
+        if not isinstance(generation, int) or generation < 1:
+            raise DeliveryOwnershipLost("Redis delivery has no acquisition generation")
+        return generation
+
+    def _forget_acquisition(self, delivery):
+        if self._active_generations.get(delivery.transport_id) == delivery.metadata.get("redis_delivery_generation"):
+            self.active_ids.discard(delivery.transport_id)
+            self._active_generations.pop(delivery.transport_id, None)
+
+    def _ownership_lost(self, delivery):
+        self._forget_acquisition(delivery)
+        delivery.metadata["redis_ownership_lost"] = True
+        raise DeliveryOwnershipLost(f"Redis acquisition no longer owned: {delivery.transport_id}")
+
+    async def ensure_ownership(self, delivery):
+        if delivery.metadata.get("redis_ownership_lost"):
+            self._ownership_lost(delivery)
+        owned = await self.broker.scripts.check_delivery(
+            stream_key=self.stream_key, group_name=self.broker.group_name,
+            transport_id=delivery.transport_id, consumer_name=self.consumer_name,
+            generation=self._generation(delivery),
         )
+        if not owned:
+            self._ownership_lost(delivery)
+
+    async def ack(self, delivery: Delivery) -> None:
+        await self._settle(delivery, mode="ack")
 
     async def ack_for_retry(self, delivery: Delivery) -> None:
-        await self._acknowledge_delivery(
-            delivery,
-            release_deduplication=False,
-        )
-
-    async def _acknowledge_delivery(
-        self,
-        delivery: Delivery,
-        *,
-        release_deduplication: bool,
-    ) -> None:
-        if delivery.transport_id is None:
-            if release_deduplication:
-                await self.broker.release_deduplication_for_message(delivery.message)
-            return
-
-        registry_message_id = self._registry_message_id(delivery)
-        await self.broker.scripts.acknowledge_delivery(
-            stream_key=self.stream_key,
-            payload_key=self.broker._message_key(registry_message_id),
-            payload_ref_key=self.broker._message_ref_key(registry_message_id),
-            group_name=self.broker.group_name,
-            transport_id=delivery.transport_id,
-        )
-        self.active_ids.discard(delivery.transport_id)
-        if release_deduplication:
-            await self.broker.release_deduplication_for_message(delivery.message)
+        await self._settle(delivery, mode="ack_for_retry")
 
     async def reject(self, delivery: Delivery, *, requeue: bool = False) -> None:
         if requeue:
-            await self.broker.send_for_retry(delivery.message)
-            await self._acknowledge_delivery(
-                delivery,
-                release_deduplication=False,
-            )
+            await self._settle(delivery, mode="retry", retry_message=delivery.message)
             return
-
-        if delivery.transport_id is None:
-            await self.broker.release_deduplication_for_message(delivery.message)
-            return
-
-        pipe = self.broker.client.pipeline()
         record = coerce_dead_letter_record(
             delivery.metadata.get("dead_letter_record"),
-            namespace=self.broker.namespace,
-            queue_name=self.queue_name,
-            actor_name=delivery.actor_name,
-            message=delivery.message,
-            delivery_id=delivery.transport_id,
-            consumer_name=self.consumer_name,
+            namespace=self.broker.namespace, queue_name=self.queue_name,
+            actor_name=delivery.actor_name, message=delivery.message,
+            delivery_id=delivery.transport_id, consumer_name=self.consumer_name,
             failure_kind="operator_reject",
             execution_mode=delivery.metadata.get("execution_mode", "async"),
             retention_deadline_ms=int(time.time() * 1000) + self.broker.dead_letter_ttl_ms,
         )
-        self.broker._queue_dead_letter_record_commands(pipe, record)
-        registry_message_id = self._registry_message_id(delivery)
-        await self.broker.scripts.acknowledge_delivery(
-            stream_key=self.stream_key,
-            payload_key=self.broker._message_key(registry_message_id),
-            payload_ref_key=self.broker._message_ref_key(registry_message_id),
-            group_name=self.broker.group_name,
-            transport_id=delivery.transport_id,
-            client=pipe,
-        )
+        await self._settle(delivery, mode="reject", dead_letter_record=record)
 
-        await pipe.execute()
-        self.active_ids.discard(delivery.transport_id)
-        await self.broker.release_deduplication_for_message(delivery.message)
+    async def _settle(self, delivery, *, mode, retry_message=None, delay=None, dead_letter_record=None):
+        if delivery.metadata.get("redis_settled"):
+            return  # Locally confirmed repeated settlement is harmless.
+        if delivery.metadata.get("redis_ownership_lost") or delivery.transport_id is None:
+            self._ownership_lost(delivery)
+        generation = self._generation(delivery)
+        message_id = self._registry_message_id(delivery)
+        if retry_message is not None and (
+            retry_message.message_id != message_id or retry_message.queue_name != self.queue_name
+        ):
+            raise ValueError("A retry must preserve its message ID and queue")
+        dedupe_mode, dedupe_id, *_ = self.broker._normalize_deduplication(delivery.message)
+        dedupe_key = (
+            self.broker._dedupe_key(self.queue_name, delivery.actor_name, dedupe_id)
+            if dedupe_mode in {"simple", "debounce"} and dedupe_id else ""
+        )
+        now_ms = int(time.time() * 1000)
+        record = dead_letter_record
+        committed = await self.broker.scripts.acknowledge_delivery(
+            keys=[
+                self.stream_key, self.broker._message_key(message_id),
+                self.broker._message_ref_key(message_id), dedupe_key,
+                self.broker._delayed_key(self.queue_name), self.broker._queue_registry_key(),
+                self.broker._dead_letter_record_key(record.dead_letter_id) if record else "",
+                self.dead_letter_key,
+            ],
+            args=[
+                self.broker.group_name, delivery.transport_id, self.consumer_name, generation,
+                mode, message_id,
+                self.broker._encode_message(retry_message) if retry_message else b"",
+                self.broker.message_ttl_ms,
+                now_ms + max(int(delay * 1000), 1) if delay and delay > 0 else 0,
+                self.queue_name,
+                record.dead_letter_id if record else "",
+                self.broker._encode_dead_letter_record(record) if record else b"",
+                self.broker._dead_letter_record_ttl_ms(record, now_ms=now_ms) if record else 1,
+                record.dead_lettered_at_ms if record else 0,
+            ],
+        )
+        if not committed:
+            self._ownership_lost(delivery)
+        delivery.metadata["redis_settled"] = True
+        self._forget_acquisition(delivery)
 
     async def extend_lease(self, delivery: Delivery, *, seconds: float) -> None:
         if delivery.transport_id is None:
@@ -1553,20 +1571,13 @@ class _RedisConsumer(Consumer):
         batch_size = self.broker.lease_extension_batch_size
         for offset in range(0, len(requests), batch_size):
             chunk = requests[offset : offset + batch_size]
-            transport_ids = [
-                delivery.transport_id
-                for delivery, _completed in chunk
-                if delivery.transport_id is not None
-            ]
             try:
-                claimed = await self.broker.client.xclaim(
-                    self.stream_key,
-                    self.broker.group_name,
-                    self.consumer_name,
-                    0,
-                    transport_ids,
-                    idle=0,
-                    justid=True,
+                claimed = await self.broker.scripts.renew_deliveries(
+                    stream_key=self.stream_key, group_name=self.broker.group_name,
+                    consumer_name=self.consumer_name,
+                    acquisitions=[(delivery.transport_id, self._generation(delivery))
+                                  for delivery, _ in chunk if delivery.transport_id is not None
+                                  and not delivery.metadata.get("redis_settled")],
                 )
             except BaseException as exc:
                 for _delivery, completed in chunk:
@@ -1576,29 +1587,29 @@ class _RedisConsumer(Consumer):
                     raise
                 continue
 
-            claimed_ids = {
-                _decode_stream_id(transport_id)
-                for transport_id in claimed
+            claimed_acquisitions = {
+                (_decode_stream_id(transport_id), int(generation))
+                for transport_id, generation in claimed
             }
             lease_deadline = time.time() + seconds
             for delivery, completed in chunk:
                 transport_id = delivery.transport_id
-                if transport_id in claimed_ids:
+                if (transport_id, delivery.metadata.get("redis_delivery_generation")) in claimed_acquisitions:
                     delivery.lease_deadline = lease_deadline
                     delivery.metadata["lease_seconds"] = seconds
                     if not completed.done():
                         completed.set_result(None)
                     continue
 
-                if transport_id not in self.active_ids:
+                if delivery.metadata.get("redis_settled"):
                     if not completed.done():
                         completed.set_result(None)
                     continue
 
                 if not completed.done():
                     completed.set_exception(
-                        RuntimeError(
-                            f"Redis did not extend active delivery lease {transport_id!r}."
+                        DeliveryOwnershipLost(
+                            f"Redis did not extend owned acquisition {transport_id!r}."
                         )
                     )
 

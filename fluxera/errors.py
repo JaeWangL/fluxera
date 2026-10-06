@@ -17,6 +17,10 @@ class QueueNotFound(BrokerError):
     """Raised when a broker cannot resolve a queue by name."""
 
 
+class DeliveryOwnershipLost(BrokerError):
+    """The transport no longer owns this acquisition; do not retry or settle it."""
+
+
 class WorkerError(FluxeraError):
     """Raised when the worker runtime encounters an invalid state."""
 

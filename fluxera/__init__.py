@@ -34,7 +34,7 @@ from .callbacks import DeadLetterContext, OutcomeContext
 from .current_state import CurrentWorkerState, get_current_worker_state
 from .dead_letters import DeadLetterRecord
 from .encoder import JSONMessageEncoder, PickleMessageEncoder
-from .errors import RateLimitExceeded
+from .errors import DeliveryOwnershipLost, RateLimitExceeded
 from .brokers.redis import RedisBroker
 from .brokers.stub import StubBroker
 from .message import Message
@@ -62,6 +62,7 @@ __all__ = [
     "DeadLetterResolution",
     "DeadLetterStatus",
     "Delivery",
+    "DeliveryOwnershipLost",
     "JSONMessageEncoder",
     "Message",
     "OutcomeContext",

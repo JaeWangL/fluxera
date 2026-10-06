@@ -159,17 +159,40 @@ reference before adding the new one.
 
 ### Related Contract: `acknowledge_delivery.lua`
 
-The acknowledgement script receives the stream key, payload key, and payload
-reference key plus consumer group and transport ID. It atomically:
+Since 0.3.1, settlement first checks the exact PEL entry's consumer name and
+acquisition generation (delivery count). A mismatch returns `0` without any
+writes. The internal wrapper accepts `keys` and `args` as documented by the
+call in `_RedisConsumer._settle`; actor and message APIs are unchanged.
 
-1. runs `XACK`
-2. runs `XDEL`
-3. decrements the payload reference only when the stream entry was deleted
-4. deletes payload and reference keys when the count reaches zero
+An owned settlement atomically enqueues its retry successor or persists its
+dead-letter record, then runs `XACK` and `XDEL`, releases the old payload
+reference, and releases terminal simple/debounce deduplication ownership.
+Successful settlement returns `1`. Retry increments the successor reference
+before releasing the previous reference and preserves the deduplication key.
+No check/enqueue/ACK round-trip gap exists for Redis `Broker.retry_delivery`.
 
-Repeating the same ACK is safe because a second `XDEL` returns zero and does not
-decrement the reference again. Retry and requeue paths enqueue the next
-reference before acknowledging the previous transport entry.
+After a response is lost, resubmission fails the ownership check instead of
+enqueuing a second successor. Callers must treat this as an uncertain outcome;
+external outcome callbacks are not a durable completion mechanism.
+
+### Related contracts: acquisition and renewal
+
+`claim_deliveries.lua` scans expired pending entries, excluding this consumer's
+active acquisitions before mutation. It captures the generation in the same
+Lua call as `XCLAIM`. Normal claims increment the generation. New `XREADGROUP >`
+entries start at generation `1`.
+
+`renew_deliveries.lua` checks each `(transport_id, generation)` and consumer
+name, renews only matching entries using `XCLAIM ... JUSTID`, and returns the
+accepted pairs. `JUSTID` preserves the counter on Redis 6.2 and 7.4; returning
+both values prevents an old A→B→A acquisition from being mistaken for the new
+one in a mixed renewal batch. `check_delivery.lua` performs a read-only guard
+before executing queued work.
+
+These contracts require that operators do not reset delivery counters with
+`RETRYCOUNT` or recreate consumer groups while attempts remain active. Old
+0.3.0 consumers do not obey the fence: drain and stop them before relying on
+the guarantee. See the README's upgrade procedure.
 
 ## 5. Contract: `remove_dedupe_key_if_owner.lua`
 

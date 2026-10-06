@@ -11,6 +11,7 @@ import random
 import time
 import traceback
 from collections import defaultdict
+from contextlib import suppress
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -27,7 +28,7 @@ from ..current_state import (
     _set_current_worker_state,
 )
 from ..dead_letters import DeadLetterRecord, FailureKind
-from ..errors import ActorNotFound, RateLimitExceeded, RemoteExecutionError, WorkerError
+from ..errors import ActorNotFound, DeliveryOwnershipLost, RateLimitExceeded, RemoteExecutionError, WorkerError
 from ..message import current_millis
 
 if TYPE_CHECKING:
@@ -973,7 +974,8 @@ class Worker:
                         failure_kind="invalid_configuration",
                         exception_message=f"Actor {delivery.actor_name!r} is not registered.",
                     )
-                    await consumer.reject(delivery, requeue=False)
+                    with suppress(DeliveryOwnershipLost):
+                        await consumer.reject(delivery, requeue=False)
                     continue
 
                 ready_queue = self.ready_queues.get(actor.execution)
@@ -985,11 +987,13 @@ class Worker:
                         execution_mode=actor.execution,
                         exception_message=f"Execution lane {actor.execution!r} is not enabled for this worker.",
                     )
-                    await consumer.reject(delivery, requeue=False)
+                    with suppress(DeliveryOwnershipLost):
+                        await consumer.reject(delivery, requeue=False)
                     continue
 
                 if not self._accepts_queue(delivery.queue_name):
-                    await consumer.reject(delivery, requeue=True)
+                    with suppress(DeliveryOwnershipLost):
+                        await consumer.reject(delivery, requeue=True)
                     continue
 
                 await ready_queue.put(_ScheduledDelivery(consumer=consumer, delivery=delivery, actor=actor))
@@ -1008,7 +1012,8 @@ class Worker:
                 continue
 
             if not self._accepts_queue(item.delivery.queue_name):
-                await item.consumer.reject(item.delivery, requeue=True)
+                with suppress(DeliveryOwnershipLost):
+                    await item.consumer.reject(item.delivery, requeue=True)
                 ready_queue.task_done()
                 continue
 
@@ -1032,7 +1037,8 @@ class Worker:
                     if admission_acquired:
                         self.admission_permits.release()
                         admission_acquired = False
-                    await item.consumer.reject(item.delivery, requeue=True)
+                    with suppress(DeliveryOwnershipLost):
+                        await item.consumer.reject(item.delivery, requeue=True)
                     ready_queue.task_done()
                     continue
 
@@ -1098,61 +1104,72 @@ class Worker:
         lease_task = self._start_lease_heartbeat(item, record)
         state_token = None
         try:
-            record.state = "running"
-            record.started_at = time.perf_counter()
-            record.started_at_ms = current_millis()
-            state_token = _set_current_worker_state(self._build_current_worker_state(item, record))
+            try:
+                await item.consumer.ensure_ownership(item.delivery)
+                record.state = "running"
+                record.started_at = time.perf_counter()
+                record.started_at_ms = current_millis()
+                state_token = _set_current_worker_state(self._build_current_worker_state(item, record))
 
-            if item.delivery.redelivered:
-                await self._emit_outcome_callbacks(
-                    item,
-                    record,
-                    event="worker_lost",
-                    option_name="on_worker_lost",
-                )
-                await self._emit_outcome_callbacks(
-                    item,
-                    record,
-                    event="redelivered",
-                    option_name="on_redelivered",
-                )
-                if self._resolve_redelivery_policy(item.actor, item.delivery) == "fail":
-                    await self._fail_redelivered_delivery(item, record)
-                    return
+                if item.delivery.redelivered:
+                    await self._emit_outcome_callbacks(
+                        item,
+                        record,
+                        event="worker_lost",
+                        option_name="on_worker_lost",
+                    )
+                    await self._emit_outcome_callbacks(
+                        item,
+                        record,
+                        event="redelivered",
+                        option_name="on_redelivered",
+                    )
+                    if self._resolve_redelivery_policy(item.actor, item.delivery) == "fail":
+                        await self._fail_redelivered_delivery(item, record)
+                        return
 
-            if record.timeout_ms is None:
-                record.result = await item.actor.run(*item.delivery.args, worker=self, **item.delivery.kwargs)
-            else:
-                async with asyncio.timeout(record.timeout_ms / 1000):
+                if record.timeout_ms is None:
                     record.result = await item.actor.run(*item.delivery.args, worker=self, **item.delivery.kwargs)
+                else:
+                    async with asyncio.timeout(record.timeout_ms / 1000):
+                        record.result = await item.actor.run(*item.delivery.args, worker=self, **item.delivery.kwargs)
 
-            record.state = "succeeded"
-            record.final_action = "ack"
-            await item.consumer.ack(item.delivery)
-            await self._emit_outcome_callbacks(
-                item,
-                record,
-                event="success",
-                option_name="on_success",
-                result=record.result,
-            )
-        except TimeoutError as exc:
-            record.state = "timed_out"
+                record.state = "succeeded"
+                record.final_action = "ack"
+                await item.consumer.ack(item.delivery)
+                await self._emit_outcome_callbacks(
+                    item,
+                    record,
+                    event="success",
+                    option_name="on_success",
+                    result=record.result,
+                )
+            except DeliveryOwnershipLost:
+                raise
+            except TimeoutError as exc:
+                record.state = "timed_out"
+                record.exception = exc
+                record.failed_at_ms = current_millis()
+                await self._handle_failure(item, item.actor, record, exc, failure_kind="timeout")
+            except asyncio.CancelledError as exc:
+                record.state = "cancelled"
+                record.exception = exc
+                record.cancel_reason = "worker_shutdown" if self._stopping else "external_cancel"
+                record.failed_at_ms = current_millis()
+                await self._handle_cancellation(item, item.actor, record)
+                raise
+            except BaseException as exc:
+                record.state = "failed"
+                record.exception = exc
+                record.failed_at_ms = current_millis()
+                await self._handle_failure(item, item.actor, record, exc, failure_kind="exception")
+        except DeliveryOwnershipLost as exc:
+            record.state = "ownership_lost"
+            record.final_action = "ownership_lost"
             record.exception = exc
             record.failed_at_ms = current_millis()
-            await self._handle_failure(item, item.actor, record, exc, failure_kind="timeout")
-        except asyncio.CancelledError as exc:
-            record.state = "cancelled"
-            record.exception = exc
-            record.cancel_reason = "worker_shutdown" if self._stopping else "external_cancel"
-            record.failed_at_ms = current_millis()
-            await self._handle_cancellation(item, item.actor, record)
-            raise
-        except BaseException as exc:
-            record.state = "failed"
-            record.exception = exc
-            record.failed_at_ms = current_millis()
-            await self._handle_failure(item, item.actor, record, exc, failure_kind="exception")
+            # No retry, dead letter, or outcome callback from a stale attempt.
+            logger.info("Stopped settling stale acquisition %r.", item.delivery.transport_id)
         finally:
             if state_token is not None:
                 _reset_current_worker_state(state_token)
@@ -1210,6 +1227,11 @@ class Worker:
             await asyncio.sleep(interval)
             try:
                 await item.consumer.extend_lease(item.delivery, seconds=lease_seconds)
+            except DeliveryOwnershipLost:
+                item.delivery.metadata["redis_ownership_lost"] = True
+                # In-flight user code cannot always be interrupted (threads or
+                # remote requests). Prevent all subsequent transport mutations.
+                return
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1563,8 +1585,8 @@ class Worker:
 
         if should_retry:
             retry_delay_ms = self._compute_retry_delay_ms(record, retry_policy)
-            await self.broker.send_for_retry(
-                item.delivery.message.copy(
+            await self.broker.retry_delivery(
+                item.consumer, item.delivery, item.delivery.message.copy(
                     options={
                         "attempt": record.attempt + 1,
                         "retries": record.attempt + 1,
@@ -1577,7 +1599,6 @@ class Worker:
             record.state = "retry_scheduled"
             record.retry_delay_ms = retry_delay_ms
             record.final_action = "retry"
-            await item.consumer.ack_for_retry(item.delivery)
             await self._emit_outcome_callbacks(
                 item,
                 record,
@@ -1765,8 +1786,8 @@ class Worker:
         failure_kind: FailureKind,
         defer_ms: int,
     ) -> None:
-        await self.broker.send_for_retry(
-            item.delivery.message.copy(
+        await self.broker.retry_delivery(
+            item.consumer, item.delivery, item.delivery.message.copy(
                 options={
                     "rate_limit_requeue_timestamp": current_millis(),
                 }
@@ -1776,7 +1797,6 @@ class Worker:
         record.state = "retry_scheduled"
         record.retry_delay_ms = defer_ms
         record.final_action = "defer"
-        await item.consumer.ack_for_retry(item.delivery)
         await self._emit_outcome_callbacks(
             item,
             record,
