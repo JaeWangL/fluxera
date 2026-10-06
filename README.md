@@ -14,7 +14,7 @@ It is built for workloads where a worker should keep a lot of I/O in flight with
 
 ## Status
 
-`0.3.0` is the current public alpha.
+`0.3.1` is the current alpha version.
 
 The runtime, Redis transport v2, revision management, benchmark harnesses, and release packaging are in place, but APIs may still change as the project hardens.
 
@@ -340,9 +340,42 @@ Mounted endpoints become:
 - Deduplication is an enqueue-time admission policy, not exactly-once execution.
 - Effectively-once side effects require idempotency keys or application-level dedupe.
 - Redis workers renew leases for long-running tasks and reclaim stale pending deliveries.
+- Redis 0.3.1 fences each acquisition by its PEL consumer and delivery generation.
+  ACK, reject/DLQ, retry/defer enqueue, dedupe release, and lease renewal check
+  that pair in the same Lua operation as the mutation. A stale attempt cannot
+  finalize a newer receiver's work, even if ownership later returns to the same
+  consumer. Normal renewal preserves the generation using `XCLAIM JUSTID`.
 - A terminal Redis ACK removes the stream entry and releases its payload reference atomically.
+- A confirmed ownership loss is recorded as `ownership_lost`; it does not invoke
+  a stale attempt's completion/failure/retry callbacks. Already-running actor
+  code, threads, and external requests can still finish; their business effects
+  require application idempotency. Broker fencing is not exactly-once execution.
 - RabbitMQ relies on native unacked redelivery: a dropped consumer connection requeues
   in-flight messages immediately, so there is no lease/heartbeat mechanism.
+
+### Upgrading Redis consumers to 0.3.1
+
+Message payloads and actor call signatures are unchanged. The Redis transport
+requires Redis 6.2 or later; tests cover 6.2.24 and the production-compatible
+7.4.3. Reclamation captures the PEL delivery counter atomically with `XCLAIM`;
+renewal never changes that counter. Do not reset delivery counters with manual
+`XCLAIM RETRYCOUNT` or delete/recreate consumer groups while deliveries are active.
+
+An old 0.3.0 worker can still ACK or renew without checking ownership. Mixed
+versions therefore do **not** provide the new fencing guarantee. Stop old workers
+from acquiring new work, keep them alive until their executions and owned pending
+deliveries have drained, then retire them before enabling the new release's
+handoff policy. If that cannot be proven, use a bounded receive pause and reconcile
+pending jobs; do not force-delete pending entries. Never infer drain from an
+expired presence heartbeat alone. A rollback to 0.3.0 needs the same drain and
+reintroduces its unfenced behavior; prefer rolling back application code while
+retaining the patched transport. No global lease or new business schema is added.
+
+`Broker.retry_delivery(consumer, delivery, message, delay=...)` is the runtime's
+attempt-aware retry boundary. Redis overrides it atomically; the default retains
+the previous publish-then-ACK behavior for RabbitMQ, Stub, and custom transports.
+Calling `send_for_retry()` directly remains a producer operation and must not be
+used by custom Redis consumer code as a substitute for fenced attempt settlement.
 
 ## Redis Registry And Cleanup
 

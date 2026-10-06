@@ -157,6 +157,9 @@ class RedisLuaScripts:
         self.client = client
         self._scripts = {
             "acknowledge_delivery": self.client.register_script(self._load("acknowledge_delivery.lua")),
+            "claim_deliveries": self.client.register_script(self._load("claim_deliveries.lua")),
+            "renew_deliveries": self.client.register_script(self._load("renew_deliveries.lua")),
+            "check_delivery": self.client.register_script(self._load("check_delivery.lua")),
             "enqueue_or_deduplicate": self.client.register_script(self._load("enqueue_or_deduplicate.lua")),
             "promote_due": self.client.register_script(self._load("promote_due.lua")),
             "remove_dedupe_key_if_owner": self.client.register_script(self._load("remove_dedupe_key_if_owner.lua")),
@@ -258,21 +261,25 @@ class RedisLuaScripts:
         )
         return EnqueueDecision.from_response(response)
 
-    async def acknowledge_delivery(
-        self,
-        *,
-        stream_key: str,
-        payload_key: str,
-        payload_ref_key: str,
-        group_name: str,
-        transport_id: str,
-        client=None,
-    ):
-        return await self._scripts["acknowledge_delivery"](
-            keys=[stream_key, payload_key, payload_ref_key],
-            args=[group_name, transport_id],
-            client=client,
+    async def acknowledge_delivery(self, *, keys, args):
+        return bool(await self._scripts["acknowledge_delivery"](keys=keys, args=args))
+
+    async def claim_deliveries(self, *, stream_key, group_name, consumer_name,
+                               lease_ms, cursor, limit, scan_size, active_ids):
+        return await self._scripts["claim_deliveries"](
+            keys=[stream_key], args=[group_name, consumer_name, lease_ms, cursor, limit, scan_size, *active_ids],
         )
+
+    async def renew_deliveries(self, *, stream_key, group_name, consumer_name, acquisitions):
+        return await self._scripts["renew_deliveries"](
+            keys=[stream_key],
+            args=[group_name, consumer_name, *[v for pair in acquisitions for v in pair]],
+        )
+
+    async def check_delivery(self, *, stream_key, group_name, transport_id, consumer_name, generation):
+        return bool(await self._scripts["check_delivery"](
+            keys=[stream_key], args=[group_name, transport_id, consumer_name, generation],
+        ))
 
     async def promote_due(
         self,

@@ -62,6 +62,9 @@ class Consumer(ABC):
     async def extend_lease(self, delivery: Delivery, *, seconds: float) -> None:
         """Extend a delivery lease when the broker supports it."""
 
+    async def ensure_ownership(self, delivery: Delivery) -> None:
+        """Check an acquisition before execution, when supported by the broker."""
+
     async def close(self, *, forget: bool = False) -> None:
         """Close any transport resources held by the consumer."""
         del forget
@@ -110,6 +113,14 @@ class Broker(ABC):
     ) -> Message:
         """Enqueue an internally retried message."""
         return await self.send(message, delay=delay)
+
+    async def retry_delivery(
+        self, consumer: Consumer, delivery: Delivery, message: Message,
+        *, delay: Optional[float] = None,
+    ) -> None:
+        """Retry and settle an attempt. Transports may implement this atomically."""
+        await self.send_for_retry(message, delay=delay)
+        await consumer.ack_for_retry(delivery)
 
     @abstractmethod
     async def open_consumer(self, queue_name: str, *, prefetch: int = 1) -> Consumer:
